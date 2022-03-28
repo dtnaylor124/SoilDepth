@@ -1,0 +1,1406 @@
+---
+title: "Transcriptomics Code for Soil Depth Paper - for Github"
+author: "Dan Naylor"
+date: "03/04/2022"
+output: html_document
+---
+
+In this study, we had a number of soil samples from either 0-5 cm or 15-25 cm depth, as well as some associated with different wheat cultivars (Alkar vs. Jose)
+and different irrigation regimes (T1 (100% moisture) vs. T4 (25% moisture) vs. T5 (control soils; 0% moisture)). We obtained RNA samples from bulk soils from a subset
+of samples (all from October 2020); this code includes the analyses we made on those samples.
+
+```{r 0.1-setup, include=FALSE}
+
+# Set the working directory. Customize this to be specific to wherever your working directory is.
+setwd("/Users/Dan.Naylor/R/SoilDepthPaper/Transcriptomics/")
+
+# Loading the packages we will need for this set of analyses.
+
+library('dplyr')
+library('vegan')
+library('phyloseq')
+library('ggplot2')
+library('gplots')
+library('stats')
+library("matrixStats")
+library("vsn")
+library("pheatmap")
+library("stringr")
+library("tidyr")
+library('ape')
+library('RColorBrewer')
+library('cowplot')
+library('minet')
+library('psych')
+library("ggpubr")
+library("viridis")
+library("grid")
+library("ggplotify")
+library('reshape2')
+library("DESeq2")
+library("KEGGREST")
+library("labdsv")
+library("formattable")
+library("openxlsx")
+# library("agricolae")
+
+# Optional: at the end of the session, save the workspace as a new RData object, and reload it the following run.
+# (there are some objects that are very large and we don't want to regenerate them every time as it will take forever)
+# save.image("RData/12252021.RData")
+# load("RData/12252021.RData")
+
+theme_set(theme_bw() + theme(strip.background = element_blank()))
+
+knitr::opts_chunk$set(echo = TRUE)
+
+```
+
+# 0.2 Import the counts data and the metadata sheet.
+
+Make these ahead of time.
+
+```{r 0.2-import-data}
+
+# Import the raw transcript counts.
+df.rna <- read.table("KEGG_rawtranscripts.tsv", header = TRUE, check.names = FALSE)
+
+# In this dataset, get rid of the top row that is simply the 'leftover' counts not assigned to a KO.
+df.rna <- df.rna[!rownames(df.rna) %in% c("-"),]
+
+# Import the metadata relevant to each of the samples.
+df.metadata <- read.table("metadata.txt", header = TRUE)
+
+# Add factor levels to the metadata table.
+df.metadata$Cultivar <- factor(df.metadata$Cultivar, levels = c("Alkar", "Jose", "Soil"))
+df.metadata$Irrigation <- factor(df.metadata$Irrigation, levels = c("T1", "T4", "T5"))
+df.metadata$Depth <- factor(df.metadata$Depth, levels = c("0-5cm", "15-25cm"))
+
+```
+
+# 0.3) Get rid of the KOs below the 10th percentile for summed abundance across samples.
+
+```{r 0.3-removing-low-abundance-KOs}
+
+# To improve the quality of the dataset, I am removing KOs that are below the 10th percentile for total counts across all samples.
+
+# Find the value of KO summed counts that is the 10th percentile.
+cutoff_10thpercentile <- quantile(rowSums(df.rna), probs = c(0.1))
+
+# Make a subsetted dataframe that excludes those low-abundance counts.
+df.rna.90 <- df.rna[rowSums(df.rna) > cutoff_10thpercentile,]
+
+```
+
+# 0.4) Normalize the counts using DESeq.
+
+```{r 0.4-DESeq-normalization, message = FALSE}
+
+# Make the initial DESeq object (unnormalized).
+dds.unnorm <- DESeqDataSetFromMatrix(countData = df.rna.90, colData = df.metadata, design = ~ Irrigation + Depth)
+
+###############################################
+### Now we can run the DESeq normalization. ###
+###############################################
+
+## What does DESeq normalization do? It performs an analysis where it estimates size factors, estimates dispersion, then creates a 
+## negative binomial GLM fitting and Wald statistics.
+dds <- DESeq(dds.unnorm)
+# ^ Note: if you get an error saying that dds.unnorm doesn't have the counts data in a dataframe form,
+# ('data must be a data.frame'), reinstalling the DESeq2 package in R seems to resolve that particular issue.
+
+#######################################################################################################
+### Perform variance-stabilizing transformation to minimize read-depth differences between samples. ###
+#######################################################################################################
+
+# Note: the vsd object is not used for statistical analyses, but it can be useful for visualizing differences 
+# between samples for applications such as ordination plots or heatmaps of expression patterns.
+vsd <- varianceStabilizingTransformation(dds, blind = FALSE) 
+# ^ Note: Blind = FALSE because we expect the samples to have difference in gene expression patterns
+# based on the design, and we want to do downstream analysis to fully visualize what these types of patterns might be.
+
+###############################################################################################################
+### For posterity, output the raw counts table and variance-stabilized counts table for archiving with GEO. ###
+###############################################################################################################
+
+# write.table(assay(dds), file = "raw_countstable_forgeo.txt", sep = "\t", col.names = NA)
+# write.table(assay(vsd), file = "variancestabilized_countstable_forgeo.txt", sep = "\t", col.names = NA)
+
+
+######################################################################################################################################
+### Repeat the above steps, only excluding control samples, so we can better study variation between the samples within the field. ###
+######################################################################################################################################
+
+# # Making subsets of the above lacking control soil.
+df.rna.90.nosoil <- df.rna.90[,!grepl("ControlSoil", colnames(df.rna.90))]
+df.metadata.nosoil <- df.metadata[!grepl("ControlSoil", rownames(df.metadata)),]
+
+
+vsd.nosoil <- DESeqDataSetFromMatrix(countData = df.rna.90.nosoil, colData = df.metadata.nosoil, design = ~ Irrigation + Depth) %>%
+  DESeq() %>% varianceStabilizingTransformation(., blind = FALSE)
+
+
+
+```
+
+
+# 1) Statistical tests on the normalized counts data.
+
+## 1.1) Bray-Curtis Distance Objects
+
+```{r 1.1-making-bray-curtis-distance-objects, eval = T}
+
+# In order to see how samples cluster (i.e. how similar they are), we're going to use Bray-Curtis dissimilarity as a distance metric 
+# (as opposed to Weighted Unifrac, as RNA-Seq by nature does not have any phylogenetic tree that would be required for Weighted Unifrac).
+
+# Note: we're using the variance-stabilized RNA-Seq object for Bray-Curtis; however, the vsd object contains negative values
+# and Bray-Curtis is incompatible with negative values. Because those values are very small (between 0 and -1)
+# and rare, we'll transform them to simply be zero counts. The influence on the distances should be negligible.
+counts.tr <- assay(vsd)
+counts.tr <- replace(counts.tr, counts.tr[,] < 0, 0)
+counts.tr <- t(counts.tr) # <- for the vegdist function, we need transcripts to be columns and samples to be rows. 
+
+# Generate the distance object for the transriptomics dataset.
+bray.tr <- vegdist(counts.tr, "bray")
+
+############################################################
+### Making a Bray-Curtis object for the no-soil dataset. ###
+############################################################
+
+counts.nosoil.tr <- assay(vsd.nosoil)
+counts.nosoil.tr <- replace(counts.nosoil.tr, counts.nosoil.tr[,] < 0, 0)
+counts.nosoil.tr <- t(counts.nosoil.tr) 
+bray.nosoil.tr <- vegdist(counts.nosoil.tr, "bray")
+
+```
+
+
+# 1.2) PERMANOVA tests for significance of experimental factors.
+
+
+```{r 1.2-permanova-and-beta-dispersion, eval = T}
+
+########################################################################################################################
+### Running PERMANOVA to determine whether 'Cultivar', 'Irrigation', and 'Depth' are significant for either dataset. ###
+########################################################################################################################
+
+permanova.tr <- adonis(bray.tr ~ Irrigation * Depth + Cultivar, data = df.metadata)
+permanova.tr[[1]] # For the full dataset with soils, Irrigation and Depth appear to be highly significant, their interaction is also significant;
+# however, Cultivar is not. This is to be expected as the bulk soil is not likely to influenced cultivar (rhizosphere soil might be, but we could not get 
+# sufficient quantities of rhizosphere soil for this analysis)
+# View(permanova.tr[[1]])
+
+permanova.nosoil.tr <- adonis(bray.nosoil.tr ~ Irrigation * Depth + Cultivar, data = df.metadata.nosoil)
+permanova.nosoil.tr[[1]] # Removing the control soils (i.e. the 'T5', no irrigation applied) makes Irrigation much less significant (p = 0.051), but Depth is still significant,
+# although the interaction of Depth and Irrigation is not significant. Cultivar is still not significant.
+# View(permanova.nosoil.tr[[1]])
+
+#########################################################################################################################
+### Running beta-dispersion tests to see if variance is significantly different between depths or irrigation regimes. ###
+#########################################################################################################################
+
+disp.bray.irrigation <- betadisper(bray.tr, df.metadata$Irrigation)
+permutest(disp.bray.irrigation, pairwise = TRUE, permutations = 999)
+# There are no significant differences in beta-dispersion between irrigation regimes.
+
+disp.bray.depth <- betadisper(bray.tr, df.metadata$Depth)
+permutest(disp.bray.depth, pairwise = TRUE, permutations = 999)
+# Also no significant differences in beta-dispersion between the two depths.
+
+```
+
+# 1.3) Alpha-diversity trends.
+
+Here, we want to test whether the diversity of the functional profiles is significantly different between depths, and/or between irrigation regimes.
+
+```{r 1.3.1-alpha-diversity-anova}
+
+# Remake the phyloseq object, from which we'll be calculating the alpha-diversity values.
+counts.div <- assay(dds, normalized = TRUE) %>% t()
+
+phy.div.otu <- otu_table(counts.div, taxa_are_rows = FALSE)
+phy.div.sample <- sample_data(df.metadata)
+
+phy.div <- merge_phyloseq(phy.div.otu, phy.div.sample)
+
+##################################
+### Calculate alpha-diversity. ###
+##################################
+
+# We're going to get Shannon's (alpha-)diversity, SImpson's evenness, and Observed (aka OTU richness),
+# using the estimate_richness function within Phyloseq.
+richness <- estimate_richness(phy.div, split = TRUE, measures = c("Shannon", "InvSimpson", "Observed"))
+
+# In order to perform ANOVA to see what factors are significant in explaining alpha-diversity,
+# we need to create a table with everything.
+alpha_table <- cbind(data.frame(sample_data(phy.div)), richness)
+
+
+#####################################################################################################
+### ANOVA to determine which experimental factors are significant for explaining alpha-diversity. ###
+#####################################################################################################
+
+# Run ANOVA using the aov() function. This takes as arguments the model we want to test
+# (i.e. the dependent variable as a function of other variables) and the dataframe in which
+# all these variables are to be found.
+
+# Start with Shannon's diversity.
+shannon_model <- aov(Shannon ~ Depth * Irrigation + Cultivar, data = alpha_table)
+# summary(shannon_model) # <- Depth is significant, Irrigation is barely above significance. Cultivar and their interaction are not.
+#                  Df  Sum Sq Mean Sq F value Pr(>F)  
+# Depth             1 0.11848 0.11848   8.871 0.0107 *
+# Irrigation        2 0.08538 0.04269   3.196 0.0743 .
+# Cultivar          1 0.00765 0.00765   0.573 0.4627  
+# Depth:Irrigation  2 0.00126 0.00063   0.047 0.9542  
+# Residuals        13 0.17362 0.01336     
+# View(summary(shannon_model)[[1]])
+
+# Now Simpson's evenness.
+simpson_model <- aov(InvSimpson ~ Depth * Irrigation + Cultivar, data = alpha_table)
+# View(summary(simpson_model)[[1]]) # Nothing is significant.
+simpson.tukey <- agricolae::HSD.test(simpson_model, "Depth", group = TRUE) 
+
+# And richness.
+richness_model <- aov(Observed ~ Depth * Irrigation + Cultivar, data = alpha_table)
+# summary(richness_model) # Depth is significant, nothing else is.
+#                  Df  Sum Sq Mean Sq F value Pr(>F)  
+# Depth             1 1255722 1255722   7.945 0.0145 *
+# Irrigation        2   77566   38783   0.245 0.7860  
+# Cultivar          1  170220  170220   1.077 0.3183  
+# Depth:Irrigation  2  495917  247958   1.569 0.2453  
+# Residuals        13 2054692  158053              
+# View(summary(richness_model)[[1]])
+
+```
+
+## 1.3.2) Making figures to visually represent alpha-diversity trends.
+
+```{r 1.3.2-alpha-diversity-figures}
+
+#################################################
+### Making boxplots for Shannon and richness. ###
+#################################################
+
+alpha_table_melt <- melt(alpha_table, variable.name = "Metric", value.name = "Value")
+alpha_table_melt$Metric <- gsub("Observed", "Richness", alpha_table_melt$Metric) %>%
+  factor(., levels = c("Shannon", "Richness", "Simpson"))
+
+# Note: we need to make graphs separately, then use plot_grid to marry them together into one figure.
+shannon_table_melt <- subset(alpha_table_melt, Metric == "Shannon")
+richness_table_melt <- subset(alpha_table_melt, Metric == "Richness")
+
+  ############################################################
+  ### 1a) Boxplot for Shannon's diversity trends by depth. ###
+  ############################################################
+
+shannon_boxplot_depth <- ggplot(shannon_table_melt, aes(x = Depth, y = Value)) +
+  geom_boxplot(aes(fill = Depth)) + # coord_cartesian(ylim=c(0, 4)) + # <- This is code to change the y-axis w/o removing effect of outliers on the boxplot.
+  # scale_fill_manual(values = palette_cat) + # Not necessary, we specify it at the end.
+  # facet_grid(Metric ~ Category, scales = "free", space = "free_x") + 
+  theme(axis.text.x=element_text(size=12,color="black",angle=60, hjust = 1),
+        axis.text.y=element_text(size=18,color="black"),
+        axis.title.y=element_text(size=24,face="bold"),
+        axis.title.x = element_blank(),
+        text=element_text(size=24)) + theme(axis.text.x = element_blank()) +
+  ylab("Shannon\n\n") +
+  ggtitle("Functional Diversity by Depth\n") +
+  # theme(legend.text = element_text(color = "white"),legend.title = element_text(color = "white"), legend.key = element_rect(fill = "white", color = "white")) + 
+  scale_fill_manual(values = c("brown4", "brown1"))
+
+  #################################################################
+  ### 1b) Boxplot for Shannon's diversity trends by irrigation. ###
+  #################################################################
+
+shannon_boxplot_irrigation <- ggplot(shannon_table_melt, aes(x = Irrigation, y = Value)) +
+  geom_boxplot(aes(fill = Irrigation)) + # coord_cartesian(ylim=c(0, 4)) + # <- This is code to change the y-axis w/o removing effect of outliers on the boxplot.
+  # scale_fill_manual(values = palette_cat) + # Not necessary, we specify it at the end.
+  # facet_grid(Metric ~ Category, scales = "free", space = "free_x") + 
+  theme(axis.text.x=element_text(size=12,color="black",angle=60, hjust = 1),
+        axis.text.y=element_text(size=18,color="black"),
+        axis.title.y=element_text(size=24,face="bold"),
+        axis.title.x = element_blank(),
+        text=element_text(size=24)) + theme(axis.text.x = element_blank()) +
+  ylab("Shannon\n\n") +
+  ggtitle("Functional Diversity by Irrigation\n") +
+  # theme(legend.text = element_text(color = "white"),legend.title = element_text(color = "white"), legend.key = element_rect(fill = "white", color = "white")) + 
+  scale_fill_manual(values = c("red", "orange", "yellow"))
+
+  ############################################################
+  ### 1c) Boxplot for functional richness trends by depth. ###
+  ############################################################
+
+richness_boxplot_depth <- ggplot(richness_table_melt, aes(x = Depth, y = Value)) +
+  geom_boxplot(aes(fill = Depth)) + # coord_cartesian(ylim=c(0, 4)) + # <- This is code to change the y-axis w/o removing effect of outliers on the boxplot.
+  # scale_fill_manual(values = palette_cat) + # Not necessary, we specify it at the end.
+  # facet_grid(Metric ~ Category, scales = "free", space = "free_x") + 
+  theme(axis.text.x=element_text(size=12,color="black",angle=60, hjust = 1),
+        axis.text.y=element_text(size=18,color="black"),
+        axis.title.y=element_text(size=24,face="bold"),
+        axis.title.x = element_blank(),
+        text=element_text(size=24)) + theme(axis.text.x = element_blank()) +
+  ylab("Richness\n\n") +
+  ggtitle("Functional Richness by Depth\n") +
+  # theme(legend.text = element_text(color = "white"),legend.title = element_text(color = "white"), legend.key = element_rect(fill = "white", color = "white")) + 
+  scale_fill_manual(values = c("brown4", "brown1"))
+
+  #################################################################
+  ### 1d) Boxplot for functional richness trends by irrigation. ###
+  #################################################################
+
+richness_boxplot_irrigation <- ggplot(richness_table_melt, aes(x = Irrigation, y = Value)) +
+  geom_boxplot(aes(fill = Irrigation)) + # coord_cartesian(ylim=c(0, 4)) + # <- This is code to change the y-axis w/o removing effect of outliers on the boxplot.
+  # scale_fill_manual(values = palette_cat) + # Not necessary, we specify it at the end.
+  # facet_grid(Metric ~ Category, scales = "free", space = "free_x") + 
+  theme(axis.text.x=element_text(size=12,color="black",angle=60, hjust = 1),
+        axis.text.y=element_text(size=18,color="black"),
+        axis.title.y=element_text(size=24,face="bold"),
+        axis.title.x = element_blank(),
+        text=element_text(size=24)) + theme(axis.text.x = element_blank()) +
+  ylab("Richness\n\n") +
+  ggtitle("Functional Richness by Irrigation\n") +
+  # theme(legend.text = element_text(color = "white"),legend.title = element_text(color = "white"), legend.key = element_rect(fill = "white", color = "white")) + 
+  scale_fill_manual(values = c("red", "orange", "yellow"))
+
+
+# Combine all the above figures together in one single plot and save it.
+alpha_fig <- plot_grid(shannon_boxplot_depth, shannon_boxplot_irrigation, richness_boxplot_depth, richness_boxplot_irrigation,
+                      ncol = 2, labels = c("a)", "b)", "c)", "d)"), label_size = 30)
+
+
+# save_plot("figures/alpha_diversity/alpha_diversity.pdf", plot = alpha_fig, ncol = 1, base_width = 12, base_height = 12, scale = 1.5)
+
+
+```
+
+#### 2) Ordination plots.
+
+Here we're using ordination to show how samples cluster (i.e. how similar their functional patterns are).
+
+```{r 2.1-pcoa-plots, fig.height = 4, fig.width = 4, eval = T}
+
+#############################################################################
+### Constructing an ordination plot for the full transcriptomics dataset. ###
+#############################################################################
+
+# We want to use the plot_ordination function to plot the ordinations, so we need to make a phyloseq object.
+# Note that we have generated something similar previously in this document; here we're including the code to
+# regenerate everything if necessary.
+phy.tr.otu <- otu_table(counts.tr, taxa_are_rows = FALSE)
+phy.tr.sample <- sample_data(df.metadata)
+
+phy.tr <- merge_phyloseq(phy.tr.otu, phy.tr.sample)
+pcoa.tr <- ordinate(phy.tr, method = "PCoA", distance = "bray")
+
+  #################################
+  ### Make the ordination plot. ###
+  #################################
+
+bray.tr.plot <- plot_ordination(phy.tr, pcoa.tr, color = "Irrigation", shape = "Depth", title = "RNA-Seq PCoA Plot - All Samples\n") +
+  geom_point(size = 6, color = "black") + geom_point(size = 5, inherit.aes = TRUE) + scale_color_manual(values =  brewer.pal(5, "Spectral")) +
+  theme(legend.text = element_text(size = 14), plot.title = element_text(size = 20, face = "bold", hjust = 0.5))
+
+bray.tr.plot
+
+# ggsave("figures/ordination_plots/pcoa_allsamples.pdf", plot = bray.tr.plot, height = 6, width = 8)
+
+```
+
+
+### 3) Indicator analysis to determine significantly enriched pathways or gene names for a given sample set.
+
+## 3.1) Annotating the original dataset with KO functions and BRITE pathways.
+
+Note: this takes several hours, so do it once and then save the object to regenerate later. If this is the first time,
+then uncomment the below code and generate the table.
+
+```{r 3.1-annotated-original-dataset}
+
+# # Initialize a dataframe.
+# annotated.table <- as.data.frame(matrix(ncol = 3, nrow = nrow(df.rna.90)))
+# colnames(annotated.table) <- c("ko", "names", "pathways")
+# 
+#   
+# for(i in 1:nrow(df.rna.90)){
+#   if(i%%100 == 0){
+#     print(i) # Note: the data frame is 12786 rows long.
+#   }
+#   annotated.table$ko[i] <- rownames(df.rna.90)[i]
+#   annotated.table$pathways[i] <- paste(tryCatch(keggGet(annotated.table$ko[i])[[1]]$PATHWAY, error = function(e) paste("Missing")), collapse = "; ")
+#   annotated.table$names[i] <- tryCatch(keggGet(annotated.table$ko[i])[[1]]$NAME, error = function(e) paste("Missing"))
+# }
+#   
+# annotated.table$pathways[annotated.table$pathways == ""] <- "Not included in Pathway or Brite"
+# 
+# write.table(annotated.table, "all_pathways_with_KO_function_and_BRITEpathways.txt", sep = "\t", col.names = NA)
+
+# We've already generated it previously, so just reading in that table with the annotations for each KO.
+annotated.table <- read.table("all_pathways_with_KO_function_and_BRITEpathways.txt", header = TRUE, row.names = 1)
+
+```
+
+
+## 3.2) Generating the indicator genes/pathways tables.
+
+
+```{r 3.2-indicator-gene-names, echo = F, message = F}
+
+######################################################
+### Get a counts table and add in the annotations. ###
+######################################################
+
+# Get the dataframe with all normalized counts
+counts.dds <- as.data.frame(counts(dds, normalized = TRUE))
+
+annotated.table2 <- annotated.table
+rownames(annotated.table2) <- annotated.table$ko
+
+# Subset the table to just the KOs present in the 'counts.dds' object.
+annotated.table3 <- annotated.table2[rownames(counts.dds),]
+
+# Marry the counts table with the corresponding annotations.
+counts.annotated  <- cbind(annotated.table3, counts.dds)
+
+#############################################
+### Adding a division factor - functions. ###
+#############################################
+
+# One way to proceed with the analysis is to replicate the counts between multiple pathways if a KO has multiple pathway matches.
+# We can do that below. There are two custom functions below
+
+# 1) The 'add_divfactor' one will see how many different BRITE pathways are matched for a given KO (i.e. how many time the separator ';' appears)
+# and uses that to calculate how many pathways there are (i.e. the factor we must divide by).
+add_divfactor <- function(function.table){
+  for(i in 1:nrow(function.table)){
+    if(i%%100 == 0){
+      print(i) # This is just to keep track of how long this will take.
+    }
+    x <- str_count(function.table$pathways[i], ";")
+    function.table$div_factor[i] <- x + 1
+  }
+  return(function.table)
+}
+
+# The 'split_bydivfactor' will split all the rows into duplicates based on the division factor calculated in the previous function.
+split_bydivfactor <- function(function.table){
+  s <- strsplit(function.table$pathways, split = ";")
+  table_toreturn <- data.frame(ko = rep(rownames(function.table), sapply(s, length)),
+                            log2FoldChange = rep(function.table$log2FoldChange, sapply(s, length)),
+                            padj = rep(function.table$padj, sapply(s, length)),
+                            direction = rep(function.table$ModuleID, sapply(s, length)),
+                            names = rep(function.table$names,sapply(s, length)),
+                            div_factor = rep(function.table$div_factor,sapply(s, length)),
+                            pathways = unlist(s))
+  return(table_toreturn)
+}
+
+
+##################################################
+### Adding a division factor - implementation. ###
+##################################################
+
+# Now that we have that function, we can add in the division factor.
+counts.div <- add_divfactor(counts.annotated)
+
+# Split by the division factor.
+div <- strsplit(counts.div$pathways, split = "; ")
+
+counts.split <- data.frame(ko = rep(counts.div$ko, sapply(div, length)),
+                           names = rep(counts.div$names, sapply(div, length)),
+                           pathways = unlist(div),
+                           div_factor = rep(counts.div$div_factor, sapply(div, length)),
+                           x18_Alkar_T4_0to5cm = rep(counts.div$`18_Alkar_T4_0-5cm`, sapply(div, length)),
+                           x31_Alkar_T1_0to5cm = rep(counts.div$`31_Alkar_T1_0-5cm`, sapply(div, length)),
+                           x38_Alkar_T4_0to5cm = rep(counts.div$`38_Alkar_T4_0-5cm`, sapply(div, length)),
+                           x40_Jose_T1_0to5cm = rep(counts.div$`40_Jose_T1_0-5cm`, sapply(div, length)),
+                           x46_Jose_T1_0to5cm = rep(counts.div$`46_Jose_T1_0-5cm`, sapply(div, length)),
+                           x46_Jose_T1_15to25cm = rep(counts.div$`46_Jose_T1_15-25cm`, sapply(div, length)),
+                           x48_Jose_T4_0to5cm = rep(counts.div$`48_Jose_T4_0-5cm`, sapply(div, length)),
+                           x48_Jose_T4_15to25cm = rep(counts.div$`48_Jose_T4_15-25cm`, sapply(div, length)),
+                           x53_Jose_T4_0to5cm = rep(counts.div$`53_Jose_T4_0-5cm`, sapply(div, length)),
+                           x53_Jose_T4_15to25cm = rep(counts.div$`53_Jose_T4_15-25cm`, sapply(div, length)),
+                           x55_Alkar_T1_0to5cm = rep(counts.div$`55_Alkar_T1_0-5cm`, sapply(div, length)),
+                           x57_Jose_T1_0to5cm = rep(counts.div$`57_Jose_T1_0-5cm`, sapply(div, length)),
+                           x57_Jose_T1_15to25cm = rep(counts.div$`57_Jose_T1_15-25cm`, sapply(div, length)),
+                           x58_Alkar_T4_0to5cm = rep(counts.div$`58_Alkar_T4_0-5cm`, sapply(div, length)),
+                           ControlSoil1_T5_0to5cm = rep(counts.div$`ControlSoil1_T5_0-5cm`, sapply(div, length)),
+                           ControlSoil1_T5_15to25cm = rep(counts.div$`ControlSoil1_T5_15-25cm`, sapply(div, length)),
+                           ControlSoil2_T5_0to5cm = rep(counts.div$`ControlSoil2_T5_0-5cm`, sapply(div, length)),
+                           ControlSoil2_T5_15to25cm = rep(counts.div$`ControlSoil2_T5_15-25cm`, sapply(div, length)),
+                           ControlSoil3_T5_0to5cm = rep(counts.div$`ControlSoil3_T5_0-5cm`, sapply(div, length)),
+                           ControlSoil3_T5_15to25cm = rep(counts.div$`ControlSoil3_T5_15-25cm`, sapply(div, length)))
+
+##############################################
+### Aggregate by gene name, or by pathway. ###
+##############################################
+
+# Aggregate by pathway.
+counts.split.aggbypathway <- select(counts.split, -ko, -names, -div_factor) %>% group_by(pathways) %>% summarise_all(sum) %>% as.data.frame()
+rownames(counts.split.aggbypathway) <- counts.split.aggbypathway$pathways
+colnames(counts.split.aggbypathway) <- gsub("x", "", colnames(counts.split.aggbypathway))
+counts.split.aggbypathway$pathways <- NULL
+
+# Aggregate by gene name.
+counts.split.aggbyname <- select(counts.split, -ko, -pathways, -div_factor) %>% group_by(names) %>% summarise_all(sum) %>% as.data.frame()
+rownames(counts.split.aggbyname) <- counts.split.aggbyname$names
+colnames(counts.split.aggbyname) <- gsub("x", "", colnames(counts.split.aggbyname))
+counts.split.aggbyname$names <- NULL
+
+######################################
+### Prepare the indval dataframes. ###
+######################################
+
+# 3) Get the necessary metadata.
+counts.metadata <- df.metadata
+counts.metadata$DepthbyIrrigation <- interaction(counts.metadata$Depth, counts.metadata$Irrigation, sep = "_by_")
+
+# 4) Note: the indval() function requires samples to be rows and species (or functions / pathways, in this case) to be columns, so we need
+# to transpose our datafames accordingly.
+counts.split.aggbypathway <- t(counts.split.aggbypathway)
+counts.split.aggbyname <- t(counts.split.aggbyname)
+
+  # Remove the OTUs that are zeros in all samples. It's incompatible with the indval function.
+counts.split.aggbypathway <- counts.split.aggbypathway[,!apply(counts.split.aggbypathway==0,2,all)]
+counts.split.aggbyname <- counts.split.aggbyname[,!apply(counts.split.aggbyname==0,2,all)]
+
+# 5) Make dataframes for the grouping variables, and numbers to assign to them. I.e. if we want to examine the trends by depth, or by irrigation,
+# or (maybe in the future) a combination of multiple variables, then we can have unique numbers to each of the levels for the exploratory factor.
+irrigation.grouping <- data.frame(Irrigation = counts.metadata$Irrigation, Num = as.numeric(as.factor(counts.metadata$Irrigation)))
+depth.grouping <- data.frame(Depth = counts.metadata$Depth, Num = as.numeric(as.factor(counts.metadata$Depth)))
+depthbyirrigation.grouping <- data.frame(DepthbyIrrigation = counts.metadata$DepthbyIrrigation, Num = as.numeric(as.factor(counts.metadata$DepthbyIrrigation)))
+
+#########################################################################
+### 6) Run the indicator species for each of the factors of interest. ###
+#########################################################################
+
+# This is a custom-made function for getting indicator species results.
+ind.summary <- function(ind.data, count.data, grouping){
+  gr <- ind.data$maxcls[ind.data$pval<=0.05]
+  iv <- ind.data$indcls[ind.data$pval<=0.05]
+  pv <- ind.data$pval[ind.data$pval<=0.05]
+  fr <- apply(count.data[,]>0, 2, sum)[ind.data$pval<=0.05]
+  
+  ind.summary <- data.frame(group = gr, indval = iv, pvalue = pv, freq = fr)
+  ind.summary <- ind.summary[order(ind.summary$group, -ind.summary$indval),]
+  
+  for(i in 1:nrow(ind.summary)){
+    x <- ind.summary$group[i]
+    y <- as.character(unique(grouping[grouping$Num == x, 1]))
+    ind.summary$group2[i] <- y
+  }
+  
+  colnames(ind.summary)[colnames(ind.summary) == "group2"] <- "Factor Name"
+  ind.summary$functions <- rownames(ind.summary) %>% gsub("\\.", " ", .) %>% gsub("  ", " ", .)
+  rownames(ind.summary) <- NULL
+  
+  return(ind.summary)
+}
+
+  # a) Run the indspecies analysis for 'names' (i.e. functions), by irrigation).
+ind.names.irrigation <- indval(counts.split.aggbyname, irrigation.grouping$Num)
+
+  # b) Run the indspecies analysis for 'names', by depth).
+ind.names.depth <- indval(counts.split.aggbyname, depth.grouping$Num)
+
+  # c) Now do indspecies analysis for pathways, first by irrigation.
+ind.pathways.irrigation <- indval(counts.split.aggbypathway, irrigation.grouping$Num)
+
+  # d) And now for pathways, by depth.
+ind.pathways.depth <- indval(counts.split.aggbypathway, depth.grouping$Num)
+
+  # e) Names, by the interactive effect.
+ind.names.depthbyirrigation <- indval(counts.split.aggbyname, depthbyirrigation.grouping$Num)
+
+  # f) Pathways, by the interactive effect.
+ind.pathways.depthbyirrigation <- indval(counts.split.aggbypathway, depthbyirrigation.grouping$Num)
+
+#####################################################################################
+### 8) Run the ind.summary function on our the indval datasets we just generated. ###
+#####################################################################################
+
+# Indicator gene names for irrigation.
+irrigation.names.indsummary <- ind.summary(ind.data = ind.names.irrigation, count.data = counts.split.aggbyname, grouping = irrigation.grouping) 
+# 1840 gene names are indicators for irrigation.
+
+# Indicator gene names for depth.
+depth.names.indsummary <- ind.summary(ind.data = ind.names.depth, count.data = counts.split.aggbyname, grouping = depth.grouping)
+# 2286 gene names are indicators for depth.
+
+# Indicator pathways for irrigation.
+irrigation.pathways.indsummary <- ind.summary(ind.data = ind.pathways.irrigation, count.data = counts.split.aggbypathway, grouping = irrigation.grouping)
+# 119 pathways are indicators for irrigation.
+
+# Indicator pathways for depth.
+depth.pathways.indsummary <- ind.summary(ind.data = ind.pathways.depth, count.data = counts.split.aggbypathway, grouping = depth.grouping)
+# 143 pathways are indicators for depth.
+
+# Indicator gene names for depth by irrigation.
+depthbyirrigation.names.indsummary <- ind.summary(ind.data = ind.names.depthbyirrigation, count.data = counts.split.aggbyname, grouping = depthbyirrigation.grouping)
+
+# Indicator pathways for depth by irrigation.
+depthbyirrigation.pathways.indsummary <- ind.summary(ind.data = ind.pathways.depthbyirrigation, count.data = counts.split.aggbypathway, grouping = depthbyirrigation.grouping)
+
+# Order these by p-value and by group.
+irrigation.names.indsummary <- irrigation.names.indsummary[order(irrigation.names.indsummary$group, irrigation.names.indsummary$pvalue),]
+depth.names.indsummary <- depth.names.indsummary[order(depth.names.indsummary$group, depth.names.indsummary$pvalue),]
+irrigation.pathways.indsummary <- irrigation.pathways.indsummary[order(irrigation.pathways.indsummary$group, irrigation.pathways.indsummary$pvalue),]
+depth.pathways.indsummary <- depth.pathways.indsummary[order(depth.pathways.indsummary$group, depth.pathways.indsummary$pvalue),]
+depthbyirrigation.names.indsummary <- depthbyirrigation.names.indsummary[order(depthbyirrigation.names.indsummary$group, depthbyirrigation.names.indsummary$pvalue),]
+depthbyirrigation.pathways.indsummary <- depthbyirrigation.pathways.indsummary[order(depthbyirrigation.pathways.indsummary$group, depthbyirrigation.pathways.indsummary$pvalue),]
+
+
+# Write the tables; consolidate all of these together into one file using the 'write.xlsx' function from the 'openxlsx' package.
+ind_list <- list("Name Indicators - Irrigation" = irrigation.names.indsummary, "Name Indicators - Depth" = depth.names.indsummary,
+                 "Pathway Indicators - Irrigation" = irrigation.pathways.indsummary, "Pathway Indicators - Depth" = depth.pathways.indsummary,
+                 "Name Indicators - Interaction" = depthbyirrigation.names.indsummary, "Pathway Indicators-Interaction" = depthbyirrigation.pathways.indsummary)
+# write.xlsx(ind_list, "figures/indicatorspecies/name_and_pathway_indicators.xlsx")
+
+
+```
+
+
+## 4. Enriched genes.
+
+# 4.1) Enrichment by depth or by irrigation.
+
+The enrichment patterns are obtained by looking intot he DESeq results objects.
+
+```{r 4.1.1-enrichment-by-depth}
+
+#####################################################################################
+### Generate the list of significantly differentiated KOs between the two depths. ###
+#####################################################################################
+
+# Make a DESeq object specifically for this comparison.
+dds_depthvolcano <- dds 
+dds_depthvolcano$Depth <- gsub("-", ".", dds_depthvolcano$Depth)
+
+# Initialize a results dataframe.
+depth_return <- as.data.frame(matrix(ncol = 9, nrow = 0))
+colnames(depth_return) <- c("baseMean", "log2FoldChange", "lfcSE", "stat", "pvalue", "padj", "names", "ModuleID", "Direction")
+
+
+# Testing to see if releveling helps.
+dds_depthvolcano$Depth <- factor(dds_depthvolcano$Depth, levels = c("0.5cm", "15.25cm"))
+dds_depthvolcano$Depth <- relevel(dds_depthvolcano$Depth, ref = "0.5cm")
+
+dds.depthres <- results(dds_depthvolcano, contrast = c("Depth", "15.25cm", "0.5cm"), tidy = FALSE)
+
+# Shrink log-fold changes accordingly using lfcShrink function.
+depthres.lfc <- lfcShrink(dds_depthvolcano, res = dds.depthres, coef = 4) # Note: you may get an error message saying "data must be a data.frame". Not sure how best to resolve this, reloading R might work.
+depthres.lfc$names <- rownames(depthres.lfc)
+    
+# Get up- and down-regulated genes based on a significant (p < 0.05) log2 fold change greater than 1 (i.e. at least double expression levels).
+depthres.lfc.up <- depthres.lfc[which(depthres.lfc$padj < 0.05 & depthres.lfc$log2FoldChange > 1),]
+depthres.lfc.up$ModuleID <- paste("15to25cm", "EnrichedRelativeTo", "0to5cm", sep = "_")
+depthres.lfc.up$Direction <- "Up"
+    
+depthres.lfc.down <- depthres.lfc[which(depthres.lfc$padj < 0.05 & depthres.lfc$log2FoldChange < -1),]
+depthres.lfc.down$ModuleID <- paste("15to25cm", "DepletedRelativeTo", "0to5cm", sep = "_")
+depthres.lfc.down$Direction <- "Down"
+
+# Add this information into the object to be returned.
+depth_return_volcano <- rbind(depth_return, as.data.frame(depthres.lfc.up), as.data.frame(depthres.lfc.down))
+
+for(i in 1:nrow(depth_return_volcano)){
+  # print(i)
+  depth_return_volcano$pathways[i] <- paste(tryCatch(keggGet(depth_return_volcano$names[i])[[1]]$PATHWAY, error = function(e) paste("Missing")), collapse = "; ")
+  depth_return_volcano$names[i] <- tryCatch(keggGet(depth_return_volcano$names[i])[[1]]$NAME, error = function(e) paste("Missing"))
+}
+
+# Reorder these by decreasing log-fold change.
+depth_return_volcano <- depth_return_volcano[order(-depth_return_volcano$log2FoldChange),]
+
+# Replace blank values in the 'pathways' column with 'Not included in Pathway or Brite' (which is true)
+depth_return_volcano$pathways[depth_return_volcano$pathways == ""] <- "Not included in Pathway or Brite"
+
+```
+
+```{r 4.1.2-volcano-plots-depth-enrichment}
+
+#############################################################
+### Use the above returned object to make a volcano plot. ###
+#############################################################
+
+# reset par
+par(mfrow = c(1,1))
+# Make a basic volcano plot with colored points: blue if padj < 0.01, red if log2FC > 1 and padj < 0.05.
+with(depthres.lfc, plot(log2FoldChange, -log10(pvalue), pch=20, main="Volcano plot - 15-25cm over 0-5cm depth enrichment", xlim=c(-3,3))) +
+  with(subset(depthres.lfc, padj<.01 ), points(log2FoldChange, -log10(pvalue), pch=20, col="blue")) + 
+  with(subset(depthres.lfc, padj<.01 & abs(log2FoldChange)>2), points(log2FoldChange, -log10(pvalue), pch=20, col="red"))
+
+
+```
+
+## 4.2.1) Repeat the previous analysis for enrichment patterns by irrigation rather than by depth.
+
+```{r 4.2.1-irrigation-enrichment}
+
+# We're including enrichment patterns based on both the in-field irrigation extremes (T1 / 100% moisture vs. T4 / 25% moisture),
+# as well as the overall extremes (T1 / 100% moisture vs. T5 / 0% moisture).
+
+######################################################
+## Starting with the T4 vs. T1 enrichment patterns. ##
+######################################################
+
+# Initialize a results dataframe.
+t4t1_return <- as.data.frame(matrix(ncol = 9, nrow = 0))
+colnames(t4t1_return) <- c("baseMean", "log2FoldChange", "lfcSE", "stat", "pvalue", "padj", "names", "ModuleID", "Direction")
+
+
+dds.t4t1.res <- results(dds, contrast = c("Irrigation", "T4", "T1"))
+
+# Shrink log-fold changes accordingly using lfcShrink function.
+t4t1.res.lfc <- DESeq2::lfcShrink(dds, res = dds.t4t1.res, coef = 2)
+t4t1.res.lfc$names <- rownames(t4t1.res.lfc)
+    
+# Get up- and down-regulated genes.
+t4t1.res.lfc.up <- t4t1.res.lfc[which(t4t1.res.lfc$padj < 0.05 & t4t1.res.lfc$log2FoldChange > 1),]
+t4t1.res.lfc.up$ModuleID <- paste("T4", "EnrichedRelativeTo", "T1", sep = "_")
+t4t1.res.lfc.up$Direction <- "Up"
+    
+t4t1.res.lfc.down <- t4t1.res.lfc[which(t4t1.res.lfc$padj < 0.05 & t4t1.res.lfc$log2FoldChange < -1),]
+t4t1.res.lfc.down$ModuleID <- paste("T4", "DepletedRelativeTo", "T1", sep = "_")
+t4t1.res.lfc.down$Direction <- "Down"
+
+t4t1_return <- rbind(t4t1_return, as.data.frame(t4t1.res.lfc.up), as.data.frame(t4t1.res.lfc.down))
+
+## Annotate the results with the corresponding KEGG information, using custom functions.
+t4t1_return2 <- t4t1_return
+
+for(i in 1:nrow(t4t1_return2)){
+  # print(i)
+  t4t1_return2$pathways[i] <- paste(tryCatch(keggGet(t4t1_return2$names[i])[[1]]$PATHWAY, error = function(e) paste("Missing")), collapse = "; ")
+  t4t1_return2$names[i] <- tryCatch(keggGet(t4t1_return2$names[i])[[1]]$NAME, error = function(e) paste("Missing"))
+}
+
+# Reorder these by decreasing log-fold change.
+t4t1_return2 <- t4t1_return2[order(-t4t1_return2$log2FoldChange),]
+
+# Replace blank values in the 'pathways' column with 'Not included in Pathway or Brite' (which is true)
+t4t1_return2$pathways[t4t1_return2$pathways == ""] <- "Not included in Pathway or Brite"
+
+################################################
+## Now for the T5 vs. T1 enrichment patterns. ##
+################################################
+
+# Initialize a results dataframe.
+t5t1_return <- as.data.frame(matrix(ncol = 9, nrow = 0))
+colnames(t5t1_return) <- c("baseMean", "log2FoldChange", "lfcSE", "stat", "pvalue", "padj", "names", "ModuleID", "Direction")
+
+
+dds.t5t1.res <- results(dds, contrast = c("Irrigation", "T5", "T1"))
+
+# Shrink log-fold changes accordingly using lfcShrink function.
+t5t1.res.lfc <- lfcShrink(dds, res = dds.t5t1.res, coef = 3)
+t5t1.res.lfc$names <- rownames(t5t1.res.lfc)
+    
+# Get up- and down-regulated genes.
+t5t1.res.lfc.up <- t5t1.res.lfc[which(t5t1.res.lfc$padj < 0.05 & t5t1.res.lfc$log2FoldChange > 1),]
+t5t1.res.lfc.up$ModuleID <- paste("T5", "EnrichedRelativeTo", "T1", sep = "_")
+t5t1.res.lfc.up$Direction <- "Up"
+    
+t5t1.res.lfc.down <- t5t1.res.lfc[which(t5t1.res.lfc$padj < 0.05 & t5t1.res.lfc$log2FoldChange < -1),]
+t5t1.res.lfc.down$ModuleID <- paste("T5", "DepletedRelativeTo", "T1", sep = "_")
+t5t1.res.lfc.down$Direction <- "Down"
+
+t5t1_return <- rbind(t5t1_return, as.data.frame(t5t1.res.lfc.up), as.data.frame(t5t1.res.lfc.down))
+
+## Annotate these with functions.
+
+t5t1_return2 <- t5t1_return
+
+for(i in 1:nrow(t5t1_return2)){
+  # print(i)
+  t5t1_return2$pathways[i] <- paste(tryCatch(keggGet(t5t1_return2$names[i])[[1]]$PATHWAY, error = function(e) paste("Missing")), collapse = "; ")
+  t5t1_return2$names[i] <- tryCatch(keggGet(t5t1_return2$names[i])[[1]]$NAME, error = function(e) paste("Missing"))
+}
+
+# Reorder these by decreasing log-fold change.
+t5t1_return2 <- t5t1_return2[order(-t5t1_return2$log2FoldChange),]
+
+# Replace blank values in the 'pathways' column with 'Not included in Pathway or Brite'
+t5t1_return2$pathways[t5t1_return2$pathways == ""] <- "Not included in Pathway or Brite"
+
+```
+
+
+```{r 4.2.2-volcano-plots-irrigation-enrichments}
+
+################################################################
+### Use the above returned object to make two volcano plots. ###
+################################################################
+
+# reset par
+par(mfrow = c(1,1))
+
+## T5 vs. T1 volcano plot
+# Make a basic volcano plot with colored points: blue if padj < 0.01, red if log2FC > 1 and padj < 0.05.
+with(dds.t5t1.res, plot(log2FoldChange, -log10(pvalue), pch=20, main="Volcano plot - T5 (0% moisture) over T1 (100% moisture) enrichment", xlim=c(-3,3))) +
+  with(subset(dds.t5t1.res, padj<.01 ), points(log2FoldChange, -log10(pvalue), pch=20, col="blue")) + 
+  with(subset(dds.t5t1.res, padj<.01 & abs(log2FoldChange)>2), points(log2FoldChange, -log10(pvalue), pch=20, col="red"))
+
+
+## T4 vs. T1 volcano plot
+with(dds.t4t1.res, plot(log2FoldChange, -log10(pvalue), pch=20, main="Volcano plot - T4 (25% moisture) over T1 (100% moisture) enrichment", xlim=c(-3,3))) +
+  with(subset(dds.t4t1.res, padj<.01 ), points(log2FoldChange, -log10(pvalue), pch=20, col="blue")) + 
+  with(subset(dds.t4t1.res, padj<.01 & abs(log2FoldChange)>2), points(log2FoldChange, -log10(pvalue), pch=20, col="red"))
+
+
+```
+
+
+# 4.3) Fisher's exact test to determine enriched BRITE pathways.
+
+This is an alternative method to ascertain enrichment patterns. Specifically: Fisher's exact test determines
+the pathways that are significantly enriched in a specific subset of samples relative to the overall dataset.
+
+```{r 4.3-enriched-categories-fishers}
+
+#################################################
+### Set up the dataset for depth enrichments. ###
+#################################################
+
+dds_depthfisher <- dds
+dds_depthfisher$Depth <- gsub("-", ".", dds_depthfisher$Depth)
+
+# Initialize a results dataframe.
+depth_return_fisher <- as.data.frame(matrix(ncol = 9, nrow = 0))
+colnames(depth_return_fisher) <- c("baseMean", "log2FoldChange", "lfcSE", "stat", "pvalue", "padj", "names", "ModuleID", "Direction")
+
+# Testing to see if releveling helps.
+dds_depthfisher$Depth <- factor(dds_depthfisher$Depth, levels = c("0.5cm", "15.25cm"))
+dds_depthfisher$Depth <- relevel(dds_depthfisher$Depth, ref = "0.5cm")
+
+dds.depthres <- results(dds_depthfisher, contrast = c("Depth", "15.25cm", "0.5cm"))
+
+# Shrink log-fold changes accordingly using lfcShrink function.
+depthres.lfc <- lfcShrink(dds_depthfisher, res = dds.depthres, coef = 4)
+depthres.lfc$names <- rownames(depthres.lfc)
+    
+# Get up- and down-regulated genes.
+depthres.lfc.up <- depthres.lfc[which(depthres.lfc$padj < 0.05 & depthres.lfc$log2FoldChange > 1),]
+depthres.lfc.up$ModuleID <- paste("15to25cm", "EnrichedRelativeTo", "0to5cm", sep = "_")
+depthres.lfc.up$Direction <- "Up"
+    
+depthres.lfc.down <- depthres.lfc[which(depthres.lfc$padj < 0.05 & depthres.lfc$log2FoldChange < -1),]
+depthres.lfc.down$ModuleID <- paste("15to25cm", "DepletedRelativeTo", "0to5cm", sep = "_")
+depthres.lfc.down$Direction <- "Down"
+
+depth_return_fisher <- rbind(depth_return_fisher, as.data.frame(depthres.lfc.up), as.data.frame(depthres.lfc.down))
+
+
+# depth_return_fisher <- depth_return
+
+for(i in 1:nrow(depth_return_fisher)){
+  # print(i)
+  depth_return_fisher$pathways[i] <- paste(tryCatch(keggGet(depth_return_fisher$names[i])[[1]]$PATHWAY, error = function(e) paste("Missing")), collapse = "; ")
+  depth_return_fisher$names[i] <- tryCatch(keggGet(depth_return_fisher$names[i])[[1]]$NAME, error = function(e) paste("Missing"))
+}
+
+# Reorder these by decreasing log-fold change.
+depth_return_fisher <- depth_return_fisher[order(-depth_return_fisher$log2FoldChange),]
+
+# Replace blank values in the 'pathways' column with 'Not included in Pathway or Brite' (which is true)
+depth_return_fisher$pathways[depth_return_fisher$pathways == ""] <- "Not included in Pathway or Brite"
+
+######################################################
+### Set up the dataset for irrigation enrichments. ###
+######################################################
+
+# Initialize a results dataframe.
+t5t1_return <- as.data.frame(matrix(ncol = 9, nrow = 0))
+colnames(t5t1_return) <- c("baseMean", "log2FoldChange", "lfcSE", "stat", "pvalue", "padj", "names", "ModuleID", "Direction")
+
+
+dds.t5t1.res <- results(dds, contrast = c("Irrigation", "T5", "T1"))
+
+# Shrink log-fold changes accordingly using lfcShrink function.
+t5t1.res.lfc <- lfcShrink(dds, res = dds.t5t1.res, coef = 3)
+t5t1.res.lfc$names <- rownames(t5t1.res.lfc)
+    
+# Get up- and down-regulated genes.
+t5t1.res.lfc.up <- t5t1.res.lfc[which(t5t1.res.lfc$padj < 0.05 & t5t1.res.lfc$log2FoldChange > 1),]
+t5t1.res.lfc.up$ModuleID <- paste("T5", "EnrichedRelativeTo", "T1", sep = "_")
+t5t1.res.lfc.up$Direction <- "Up"
+    
+t5t1.res.lfc.down <- t5t1.res.lfc[which(t5t1.res.lfc$padj < 0.05 & t5t1.res.lfc$log2FoldChange < -1),]
+t5t1.res.lfc.down$ModuleID <- paste("T5", "DepletedRelativeTo", "T1", sep = "_")
+t5t1.res.lfc.down$Direction <- "Down"
+
+t5t1_return <- rbind(t5t1_return, as.data.frame(t5t1.res.lfc.up), as.data.frame(t5t1.res.lfc.down))
+
+## Annotate these with functions.
+
+t5t1_return2 <- t5t1_return
+
+for(i in 1:nrow(t5t1_return2)){
+  # print(i)
+  t5t1_return2$pathways[i] <- paste(tryCatch(keggGet(t5t1_return2$names[i])[[1]]$PATHWAY, error = function(e) paste("Missing")), collapse = "; ")
+  t5t1_return2$names[i] <- tryCatch(keggGet(t5t1_return2$names[i])[[1]]$NAME, error = function(e) paste("Missing"))
+}
+
+# Reorder these by decreasing log-fold change.
+t5t1_return2 <- t5t1_return2[order(-t5t1_return2$log2FoldChange),]
+
+# Replace blank values in the 'pathways' column with 'Not included in Pathway or Brite' (which is true)
+t5t1_return2$pathways[t5t1_return2$pathways == ""] <- "Not included in Pathway or Brite"
+
+t5t1_return_fisher <- t5t1_return2
+
+depth_return_fisher2 <- add_divfactor(depth_return_fisher) %>% split_bydivfactor(.)
+
+t5t1_return_fisher2 <- add_divfactor(t5t1_return_fisher) %>% split_bydivfactor(.)
+
+###########################
+### Fisher's exact test ###
+###########################
+
+# How many genes in the annotated dataset have KEGG annotations?
+annotated.nomissing <- annotated.table[annotated.table$names != "Missing",]
+numGenesinGenome <- nrow(annotated.nomissing)
+
+# What are the unique pathways that are present in the full dataset?
+s <- strsplit(annotated.nomissing$pathways, split = "; ")
+pathways.unique <- unlist(s) %>% unique()
+
+# Function for Fisher's exact test.
+fisher_enrichedpathways <- function(pathways = pathways.unique, enriched_dataset = depth_return2, enrichment = "15to25cm_EnrichedRelativeTo_0to5cm", annotated = annotated.nomissing){
+  outputData <- NULL
+  
+  genesInSet <- enriched_dataset[enriched_dataset$ModuleID == enrichment, "names"]
+  genesInSet <- genesInSet[genesInSet != "Missing"]
+  numGenesInSet <- length(genesInSet)
+  print(paste("numGenesInSet", numGenesInSet, sep = " "))
+  
+  numGenesInGenome <- nrow(annotated)
+  print(paste("numGenesInGenome", numGenesInGenome, sep = " "))
+  
+  for(i in pathways){
+    
+    # print(i)
+  # 1) Subset the annotated dataset to just the KOs that are associated with a particular pathway.
+    WithAnnot <- annotated[grepl(i, annotated$pathways),]
+    numGenesInGenomeWithAnnot <- nrow(WithAnnot) # How many KOs in the complete dataset are associated with this pathway?
+    genesInGenomeWithAnnot <- WithAnnot$names # What are the names of these KOs?
+    
+  # 2) How many genes in our enrichment (NOT the full dataset) are associated with this same pathway?
+    numGenesInSetWithAnnot <- length(intersect(genesInSet, genesInGenomeWithAnnot))
+    
+    
+  # 3) Run Fisher's exact test
+    counts <- matrix(c(numGenesInSetWithAnnot, numGenesInSet-numGenesInSetWithAnnot,
+                       numGenesInGenomeWithAnnot, numGenesInGenome-numGenesInGenomeWithAnnot), nrow=2)
+    fish.res <- fisher.test(counts)
+    
+    if (fish.res$p.value <= 0.05){
+      pModule <- numGenesInSetWithAnnot/numGenesInSet
+      pGenome <- numGenesInGenomeWithAnnot/numGenesInGenome
+      
+      ratio <- pModule/pGenome
+      
+      if (pModule > pGenome){
+        outputData <- rbind(outputData, cbind(enrich = enrichment, pathway=i, PVal=fish.res$p.value, Ratio=ratio, PercentageInModule=pModule, PercentageInGenome=pGenome)) 
+      }
+    }  
+  }
+  
+  return(outputData)
+}
+
+
+# Now we have the Fisher's function, we can run it on our various enrichment dataframes.
+
+  # 1) Depth enrichments.
+
+enrichedpathways_15to25cm_relativeto_0to5cm <- fisher_enrichedpathways(pathways = pathways.unique, enriched_dataset = depth_return_fisher,
+                                                  enrichment = "15to25cm_EnrichedRelativeTo_0to5cm", annotated = annotated.nomissing) %>% as.data.frame()
+
+enrichedpathways_0to5cm_relativeto_15to25cm <- fisher_enrichedpathways(pathways = pathways.unique, enriched_dataset = depth_return_fisher,
+                                                  enrichment = "15to25cm_DepletedRelativeTo_0to5cm", annotated = annotated.nomissing)
+
+  # 2) T5 vs. T1 enrichments.
+
+enrichedpathways_t5_relativeto_t1 <- fisher_enrichedpathways(pathways = pathways.unique, enriched_dataset = t5t1_return_fisher,
+                                                  enrichment = "T5_EnrichedRelativeTo_T1", annotated = annotated.nomissing)
+
+enrichedpathways_t1_relativeto_t5 <- fisher_enrichedpathways(pathways = pathways.unique, enriched_dataset = t5t1_return_fisher,
+                                                  enrichment = "T5_DepletedRelativeTo_T1", annotated = annotated.nomissing)
+
+
+```
+
+
+# 5) Relative abundance plot of pathways across our different samples.
+
+```{r 5.1-relative-abundance-figures-split-counts}
+
+# Determine what the top 'n' pathways are. Here, we're making n = 20.
+n <- 20
+
+counts.split2 <- counts.split
+counts.split2$div_factor <- NULL
+counts.split2$rowsums <- rowSums(select_if(counts.split2, is.numeric))
+
+# Sort the counts in descending order by most abundant pathways.
+counts.sorted <- aggregate(counts.split2$rowsums, by = list(pathways = counts.split2$pathways), FUN=sum)
+counts.sorted <- counts.sorted[order(-counts.sorted$x),]
+
+# Determine what the top 'n' pathways are.
+top_pathways <- counts.sorted$pathways[1:(n+1)]
+top_pathways <- top_pathways[top_pathways != "Not included in Pathway or Brite"]
+
+counts.split2$pathways[!counts.split2$pathways %in% top_pathways] <- "Other"
+counts.split2 <- data.frame(counts.split2)
+
+
+counts.split3 <- select(counts.split2, -c(rowsums, names, ko)) %>%
+  group_by(pathways) %>% 
+  summarise(across(everything(), sum)) %>% data.frame() 
+
+rownames(counts.split3) <- counts.split3$pathways
+counts.split3$pathways <- NULL
+counts.split3 <- t(counts.split3) %>% as.data.frame()
+
+counts.split3$Replicate <- rownames(counts.split3) %>% gsub("_T5", "_Soil_T5", .)
+
+counts.split3 <- separate(counts.split3, col = Replicate, into = c("Location", "Cultivar", "Irrigation", "Depth"), sep = "_", remove = FALSE)
+
+# Melt the counts table for easier graphing.
+counts.split.melted <- melt(counts.split3, variable.name = "Pathway", value.name = "Counts")
+
+# Make the variables into factors with levels.
+counts.split.melted$Irrigation <- factor(counts.split.melted$Irrigation, levels = c("T1", "T4", "T5"))
+counts.split.melted$Cultivar <- factor(counts.split.melted$Cultivar, levels = c("Alkar", "Jose", "Soil"))
+counts.split.melted$Depth <- factor(counts.split.melted$Depth, levels = c("0to5cm", "15to25cm"))
+
+# Make the pathways into factors.
+pathway_list <- as.character(counts.split.melted$Pathway)
+pathway_list <- c(sort(unique(pathway_list[pathway_list != "Other"])), "Other")
+counts.split.melted$Pathway <- factor(counts.split.melted$Pathway, levels = pathway_list)
+counts.split.melted$Replicate <- gsub("x", "", counts.split.melted$Replicate)
+
+###############################################################
+### Making a relative abundance figure for trends by depth. ###
+###############################################################
+
+# OPTIONAL - Removing "Other" from the plot to more easily view the trends in the top 'n' pathways.
+# counts.split.melted.noother <- counts.split.melted[counts.split.melted$Pathway != "Other",]
+
+comparison_plot_depth_allreps <- ggplot(data=counts.split.melted,aes(x=Replicate,y=Counts,fill=Pathway)) + 
+  geom_bar(stat="identity", position = "fill") + 
+  facet_wrap( ~ Depth, scales = "free_x", nrow=1) +
+  # scale_fill_manual(values = c25) +
+  scale_fill_manual(values = c(brewer.pal(10,"Spectral"), viridis(5), magma(5), "grey34"), drop = FALSE) +
+  theme(axis.text.x=element_text(size=10,color="black", angle = 60, hjust = 1), axis.text.y=element_text(size=16,color="black"),
+        axis.title=element_text(size=16,face="bold"),text=element_text(size=16), plot.title = element_text(hjust = 0.5),
+        legend.title = element_text(size = 20)) + theme(legend.position = "none", axis.title.x = element_blank()) +
+  ylab("Relative Abundance\n") + ggtitle("Pathway Relative Abundance\nAll Replicates by Depth\nTop 20 Functions Only") +
+  theme(legend.text = element_text(size = 18), plot.title = element_text(size = 24, face = "bold")) + theme(panel.spacing = unit(1, "lines"))
+  
+comparison_plot_depth_repsconsolidated <- ggplot(data=counts.split.melted,aes(x=Depth,y=Counts,fill=Pathway)) + 
+  geom_bar(stat="identity", position = "fill") + 
+  # facet_wrap( ~ Depth, scales = "free_x", nrow=1) +
+  # scale_fill_manual(values = c25) +
+  scale_fill_manual(values = c(brewer.pal(10,"Spectral"), viridis(5), magma(5), "grey34"), drop = FALSE, guide = guide_legend(ncol = 1)) +
+  theme(axis.text.x=element_text(size=10,color="black", angle = 60, hjust = 1), axis.text.y=element_text(size=16,color="black"),
+        axis.title=element_text(size=16,face="bold"),text=element_text(size=16), plot.title = element_text(hjust = 0.5),
+        legend.title = element_text(size = 20)) +
+  ylab("Relative Abundance\n") + ggtitle("Pathway Relative Abundance\nConsolidated By Depth\nTop 20 Functions Only") +
+  theme(legend.text = element_text(size = 18), plot.title = element_text(size = 24, face = "bold")) + theme(panel.spacing = unit(1, "lines"))
+
+# plot_grid(comparison_plot_depth_allreps, comparison_plot_depth_repsconsolidated, ncol = 2, rel_widths = c(1, 1)) %>%
+#   save_plot("figures/relativeabundance/DepthRelAbundance_addedcounts_both.pdf", plot = ., base_width = 12, base_height = 8, scale = 1.5)
+
+####################################################################
+### Making a relative abundance figure for trends by irrigation. ###
+####################################################################
+
+comparison_plot_irrigation_allreps <- ggplot(data=counts.split.melted,aes(x=Replicate,y=Counts,fill=Pathway)) + 
+  geom_bar(stat="identity", position = "fill") + 
+  facet_wrap( ~ Irrigation, scales = "free_x", nrow=1) +
+  # scale_fill_manual(values = c25) +
+  scale_fill_manual(values = c(brewer.pal(10,"Spectral"), viridis(5), magma(5), "grey34"), drop = FALSE) +
+  theme(axis.text.x=element_text(size=10,color="black", angle = 60, hjust = 1), axis.text.y=element_text(size=16,color="black"),
+        axis.title=element_text(size=16,face="bold"),text=element_text(size=16), plot.title = element_text(hjust = 0.5),
+        legend.title = element_text(size = 20)) + theme(legend.position = "none", axis.title.x = element_blank()) +
+  ylab("Relative Abundance\n") + ggtitle("Pathway Relative Abundance\nAll Replicates by Irrigation\nTop 20 Functions Only") +
+  theme(legend.text = element_text(size = 18), plot.title = element_text(size = 24, face = "bold")) + theme(panel.spacing = unit(1, "lines"))
+  
+comparison_plot_irrigation_repsconsolidated <- ggplot(data=counts.split.melted,aes(x=Irrigation,y=Counts,fill=Pathway)) + 
+  geom_bar(stat="identity", position = "fill") + 
+  # facet_wrap( ~ Depth, scales = "free_x", nrow=1) +
+  # scale_fill_manual(values = c25) +
+  scale_fill_manual(values = c(brewer.pal(10,"Spectral"), viridis(5), magma(5), "grey34"), drop = FALSE, guide = guide_legend(ncol = 1)) +
+  theme(axis.text.x=element_text(size=10,color="black", angle = 60, hjust = 1), axis.text.y=element_text(size=16,color="black"),
+        axis.title=element_text(size=16,face="bold"),text=element_text(size=16), plot.title = element_text(hjust = 0.5),
+        legend.title = element_text(size = 20)) +
+  ylab("Relative Abundance\n") + ggtitle("Pathway Relative Abundance\nConsolidated By Irrigation\nTop 20 Functions Only") +
+  theme(legend.text = element_text(size = 18), plot.title = element_text(size = 24, face = "bold")) + theme(panel.spacing = unit(1, "lines"))
+
+# plot_grid(comparison_plot_irrigation_allreps, comparison_plot_irrigation_repsconsolidated, ncol = 2, rel_widths = c(1, 1)) %>%
+#   save_plot("figures/relativeabundance/IrrigationRelAbundance_addedcounts_both.pdf", plot = ., base_width = 12, base_height = 8, scale = 1.5)
+
+
+```
+
+
+## 6) ANOVA tests to see if individual pathways are significantly different by experimental factor.
+
+```{r 6.1-anova-tests-pathway-abundances}
+
+# Make a dataframe with the pathways with counts aggregated together. This is from the dataframe with the SPLIT (not divided) counts between multiple pathways
+# if more than pathway was associated with a given KO.
+counts.split.aggbypathway <- select(counts.split, -ko, -names, -div_factor) %>% group_by(pathways) %>% summarise_all(sum) %>% as.data.frame()
+rownames(counts.split.aggbypathway) <- counts.split.aggbypathway$pathways
+colnames(counts.split.aggbypathway) <- gsub("x", "", colnames(counts.split.aggbypathway))
+counts.split.aggbypathway$pathways <- NULL
+
+# Bind the counts together with the metadata.
+df.pathway <- cbind(df.metadata, t(counts.split.aggbypathway))
+
+pathways.aov.sig <- matrix(nrow = length(pathways.unique), ncol = 4) %>% as.data.frame()
+colnames(pathways.aov.sig) <- c("pathway", "cultivar.sig", "irrigation.sig", "depth.sig")
+
+# Run a loop with ANOVA for each pathway to determine which experimental factors are significant.
+for(i in 1:length(pathways.unique)){
+  pw <- paste("`", pathways.unique[i], "`", " ~ Cultivar + Irrigation + Depth", sep = "") %>% as.formula()
+  
+  if(pathways.unique[i] %in% colnames(df.pathway)){
+    x <- aov(pw, data = df.pathway) %>% summary() %>% unclass() %>% data.frame(., check.names = TRUE, stringsAsFactors = TRUE)
+    rownames(x) <- str_trim(rownames(x))
+
+    pathways.aov.sig$pathway[i] <- pathways.unique[i]
+    pathways.aov.sig$cultivar.sig[i] <- x[rownames(x) == "Cultivar", colnames(x) == "Pr..F."]
+    pathways.aov.sig$irrigation.sig[i] <- x[rownames(x) == "Irrigation", colnames(x) == "Pr..F."]
+    pathways.aov.sig$depth.sig[i] <- x[rownames(x) == "Depth", colnames(x) == "Pr..F."]
+  }
+
+}
+
+options(scipen = 100)
+
+# Note: 'formattable' is from the package of the same name.
+# Here we're making a table that is color coded based on significances of the variables for each of the BRITE pathways
+# (i.e. black if not significant, gray if exactly p = 0.05, and red if significant at p < 0.05).
+rounded.pathways.aov.sig <- formattable(pathways.aov.sig, list(cultivar.sig = formatter("span", style = ~style(font.weight = "bold", color = ifelse(cultivar.sig > 0.05,"black",
+                                                                                                        ifelse(cultivar.sig == 0.05,"grey",
+                                                                                                               ifelse(cultivar.sig <0.05, "red",NA))))),
+                                   irrigation.sig = formatter("span", style = ~style(font.weight = "bold", color = ifelse(irrigation.sig > 0.05,"black",
+                                                                                                        ifelse(irrigation.sig == 0.05,"grey",
+                                                                                                               ifelse(irrigation.sig <0.05, "red",NA))))),
+                                   depth.sig = formatter("span", style = ~style(font.weight = "bold", color = ifelse(depth.sig > 0.05,"black",
+                                                                                                        ifelse(depth.sig == 0.05,"grey",
+                                                                                                               ifelse(depth.sig <0.05, "red",NA)))))
+                                   ))
+
+rounded.pathways.aov.sig[,2:4] <- round(rounded.pathways.aov.sig[,2:4], digits = 3)
+rounded.pathways.aov.sig <- rounded.pathways.aov.sig[order(rounded.pathways.aov.sig$pathway),]
+
+# If you want to see the color coded table, uncomment the below line and run it.
+# rounded.pathways.aov.sig
+
+# Check to see how many pathways are significant for each variable.
+length(rounded.pathways.aov.sig$cultivar.sig[rounded.pathways.aov.sig$cultivar.sig < 0.05]) # 94 pathways are significantly impacted by cultivar (note this includes the dry vs. wet soil)
+length(rounded.pathways.aov.sig$irrigation.sig[rounded.pathways.aov.sig$irrigation.sig < 0.05]) # 40 pathways are significantly impacted by irrigation
+length(rounded.pathways.aov.sig$depth.sig[rounded.pathways.aov.sig$depth.sig < 0.05]) # 141 pathways are significantly impacted by depth
+
+
+## What are the top 10 pathways (by significance) affected by cultivar, irrigation, and depth? ##
+
+# By cultivar:
+pathways.aov.sig[order(pathways.aov.sig$cultivar.sig)[1:10],colnames(pathways.aov.sig) == "pathway"]
+  # (1) Ether lipid metabolism
+  # (2) Cytosolic DNA-sensing pathway
+  # (3) Plant-pathogen interaction
+  # (4) TNF signaling pathway
+  # (5) Non-alcoholic fatty liver disease
+  # (6) mRNA surveillance pathway
+  # (7) Viral carcinogenesis
+  # (8) Spinocerebellar ataxia
+  # (9) D-Amino acid metabolism
+  # (10) Basal transcription factors
+
+# By irrigation:
+pathways.aov.sig[order(pathways.aov.sig$irrigation)[1:10],colnames(pathways.aov.sig) == "pathway"]
+  # [1] "Gap junction"                            
+  # [2] "Systemic lupus erythematosus" 
+  # [3] "Glycine, serine and threonine metabolism"
+  # [4] "MAPK signaling pathway"     
+  # [5] "Synaptic vesicle cycle"
+  # [6] "Non-alcoholic fatty liver disease"
+  # [7] "Prion disease" 
+  # [8] "Spliceosome"               
+  # [9] "Phototransduction"        
+  # [10] "B cell receptor signaling pathway"                  
+
+# By depth:
+pathways.aov.sig[order(pathways.aov.sig$depth)[1:10],colnames(pathways.aov.sig) == "pathway"]
+#  [1] "C5-Branched dibasic acid metabolism"                      
+#  [2] "Alanine, aspartate and glutamate metabolism"            
+#  [3] "Insulin signaling pathway"          
+#  [4] "Glucagon signaling pathway"                
+#  [5] "Fatty acid degradation"                       
+#  [6] "Staphylococcus aureus infection"            
+#  [7] "Pyrimidine metabolism"         
+#  [8] "alpha-Linolenic acid metabolism"                     
+#  [9] "Fat digestion and absorption"
+#  [10] "Lysine degradation" 
+
+```
+
+
+
+# 6.2) ANOVA for significant changes in pathways by depth or irrigation, with Tukey's significances and directionality included.
+
+
+```{r 6.2-directional-changes-by-depth-or-irrigation}
+
+# Make a dataframe with the pathways with counts aggregated together. This is from the dataframe with the SPLIT (not divided) counts between multiple pathways
+# if more than pathway was associated with a given KO.
+counts.split.aggbypathway <- select(counts.split, -ko, -names, -div_factor) %>% group_by(pathways) %>% summarise_all(sum) %>% as.data.frame()
+rownames(counts.split.aggbypathway) <- counts.split.aggbypathway$pathways
+colnames(counts.split.aggbypathway) <- gsub("x", "", colnames(counts.split.aggbypathway))
+counts.split.aggbypathway$pathways <- NULL
+
+# Bind the counts together with the metadata.
+df.pathway <- cbind(df.metadata, t(counts.split.aggbypathway))
+
+# Initialize the dataframe we'll be storing the results in.
+pathways.aov.sig <- matrix(nrow = length(pathways.unique), ncol = 11) %>% as.data.frame()
+colnames(pathways.aov.sig) <- c("pathway", "cultivar.sig", "irrigation.sig", "depth.sig", "Avg_T1", "Avg_T4", "Avg_T5", "Irrigation_Directionality",
+                                "Avg_0to5cm", "Avg_15to25cm", "Depth_Directionality")
+
+#########################################
+# Run a loop to calculate everything. ###
+#########################################
+
+for(i in 1:length(pathways.unique)){
+    pw <- paste("`", pathways.unique[i], "`", " ~ Cultivar + Irrigation + Depth", sep = "") %>% as.formula()
+    
+    if(pathways.unique[i] %in% colnames(df.pathway)){
+      x <- aov(pw, data = df.pathway) %>% summary() %>% unclass() %>% data.frame(., check.names = TRUE, stringsAsFactors = TRUE)
+      rownames(x) <- str_trim(rownames(x))
+      
+      pathways.aov.sig$pathway[i] <- pathways.unique[i]
+      pathways.aov.sig$cultivar.sig[i] <- x[rownames(x) == "Cultivar", colnames(x) == "Pr..F."]
+      pathways.aov.sig$irrigation.sig[i] <- x[rownames(x) == "Irrigation", colnames(x) == "Pr..F."]
+      pathways.aov.sig$depth.sig[i] <- x[rownames(x) == "Depth", colnames(x) == "Pr..F."]
+      
+      tukey.irr <- aov(pw, data = df.pathway) %>% agricolae::HSD.test(., "Irrigation", group = TRUE)
+      pathways.aov.sig$Avg_T1[i] <- tukey.irr$groups["T1", pathways.unique[i]]
+      pathways.aov.sig$Avg_T4[i] <- tukey.irr$groups["T4", pathways.unique[i]]
+      pathways.aov.sig$Avg_T5[i] <- tukey.irr$groups["T5", pathways.unique[i]]
+      
+      if(pathways.aov.sig$irrigation.sig[i] < 0.05){
+        if(pathways.aov.sig$Avg_T1[i] > pathways.aov.sig$Avg_T5[i] | ((pathways.aov.sig$Avg_T4[i] > pathways.aov.sig$Avg_T5[i]) & (pathways.aov.sig$Avg_T1[i] > pathways.aov.sig$Avg_T5[i]))) {
+          pathways.aov.sig$Irrigation_Directionality[i] <- "Non-uniformly Decreases with Drought"
+      
+        }
+        if((pathways.aov.sig$Avg_T1[i] > pathways.aov.sig$Avg_T4[i]) & (pathways.aov.sig$Avg_T4[i] > pathways.aov.sig$Avg_T5[i])){
+          pathways.aov.sig$Irrigation_Directionality[i] <- "Uniformly Decreases with Drought"
+      
+        }
+      }
+      
+      if(pathways.aov.sig$irrigation.sig[i] < 0.05){
+        if(pathways.aov.sig$Avg_T1[i] < pathways.aov.sig$Avg_T5[i] | ((pathways.aov.sig$Avg_T4[i] < pathways.aov.sig$Avg_T5[i]) & (pathways.aov.sig$Avg_T1[i] < pathways.aov.sig$Avg_T5[i]))) {
+          pathways.aov.sig$Irrigation_Directionality[i] <- "Non-uniformly Increases with Drought"
+      
+        }
+        if((pathways.aov.sig$Avg_T1[i] < pathways.aov.sig$Avg_T4[i]) & (pathways.aov.sig$Avg_T4[i] < pathways.aov.sig$Avg_T5[i])){
+          pathways.aov.sig$Irrigation_Directionality[i] <- "Uniformly Increases with Drought"
+      
+        }
+      }
+      
+      tukey.depth <- aov(pw, data = df.pathway) %>% agricolae::HSD.test(., "Depth", group = TRUE)
+      pathways.aov.sig$Avg_0to5cm[i] <- tukey.depth$groups["0-5cm", pathways.unique[i]]
+      pathways.aov.sig$Avg_15to25cm[i] <- tukey.depth$groups["15-25cm", pathways.unique[i]]
+      
+      if(pathways.aov.sig$depth.sig[i] < 0.05){
+        if(pathways.aov.sig$Avg_0to5cm[i] < pathways.aov.sig$Avg_15to25cm[i]){
+          pathways.aov.sig$Depth_Directionality[i] <- "Significantly Increases with Greater Depth"
+        }
+        if(pathways.aov.sig$Avg_0to5cm[i] > pathways.aov.sig$Avg_15to25cm[i]){
+          pathways.aov.sig$Depth_Directionality[i] <- "Significantly Decreases with Greater Depth"
+        }
+      }
+    }
+}
+
+
+pathways.aov.sig$Depth_Directionality[is.na(pathways.aov.sig$Depth_Directionality)] <- "No significant change"
+pathways.aov.sig$Irrigation_Directionality[is.na(pathways.aov.sig$Irrigation_Directionality)] <- "No significant change"
+
+
+# In case we need to regenerate it later.
+pathways.aov.sig.copy <- pathways.aov.sig
+# pathways.aov.sig <- pathways.aov.sig.copy
+
+#####################################
+### Add in colors to the columns. ###
+#####################################
+
+
+pathways.aov.sig <- formattable(pathways.aov.sig, list(cultivar.sig = formatter("span", style = ~style(font.weight = "bold", color = ifelse(cultivar.sig > 0.05,"black",
+                                                                                                        ifelse(cultivar.sig == 0.05,"grey",
+                                                                                                               ifelse(cultivar.sig <0.05, "red",NA))))),
+                                   irrigation.sig = formatter("span", style = ~style(font.weight = "bold", color = ifelse(irrigation.sig > 0.05,"black",
+                                                                                                        ifelse(irrigation.sig == 0.05,"grey",
+                                                                                                               ifelse(irrigation.sig <0.05, "red",NA))))),
+                                   depth.sig = formatter("span", style = ~style(font.weight = "bold", color = ifelse(depth.sig > 0.05,"black",
+                                                                                                        ifelse(depth.sig == 0.05,"grey",
+                                                                                                               ifelse(depth.sig <0.05, "red",NA))))),
+                                   Irrigation_Directionality = formatter("span", style = ~style(font.weight = "bold",
+                                                                                                color = ifelse(Irrigation_Directionality == "Non-uniformly Decreases with Drought","lightblue",
+                                                                                                               ifelse(Irrigation_Directionality == "Uniformly Decreases with Drought","blue",
+                                                                                                                     ifelse(Irrigation_Directionality == "Non-uniformly Increases with Drought","orange",
+                                                                                                                            ifelse(Irrigation_Directionality == "Uniformly Increases with Drought","red",
+                                                                                                                                   ifelse(Irrigation_Directionality == "No significant change", "grey", NA))))))),
+                                   Depth_Directionality = formatter("span", style = ~style(font.weight = "bold",
+                                                                                           color = ifelse(Depth_Directionality == "Significantly Increases with Greater Depth", "brown",
+                                                                                                          ifelse(Depth_Directionality == "Significantly Decreases with Greater Depth", "green",
+                                                                                                                 ifelse(Depth_Directionality == "No significant change", "grey", NA)))))
+                                   ))
+
+
+
+pathways.aov.sig <- pathways.aov.sig[order(pathways.aov.sig$pathway),]
+
+
+# write.table(pathways.aov.sig, "figures/abundances_anova/significant_pathway_changes_byfactor.txt", sep = "\t", col.names = NA)
+
+```
+
+
+
+#### 7) Generating lists of enriched KOs to use for iPATH 3.0.
+
+```{r 7.1-list-of-enriched-KOs-for-iPATH}
+
+# Subset the KOs from the previously generated 'depth_return' object.
+depth.ipath.15to25 <- data.frame("KO" = rownames(depth_return[depth_return$Direction == "Up",]), "Color" = "#FF0000", "Width" = "W20")
+depth.ipath.15to25$KO <- gsub("ko:", "", depth.ipath.15to25$KO) %>% gsub('\\"', '', .)
+
+depth.ipath.0to5 <- data.frame("KO" = rownames(depth_return[depth_return$Direction == "Down",]), "Color" = "#0000FF", "Width" = "W20")
+depth.ipath.0to5$KO <- gsub("ko:", "", depth.ipath.0to5$KO) %>% gsub('\\"', '', .)
+
+# Repeat for irrigation.
+irrigation.ipath.T5 <- data.frame("KO" = rownames(t5t1_return2[t5t1_return2$Direction == "Up",]), "Color" = "#FF0000", "Width" = "W20")
+irrigation.ipath.T5$KO <- gsub("ko:", "", irrigation.ipath.T5$KO) %>% gsub('\\"', '', .)
+
+irrigation.ipath.T1 <- data.frame("KO" = rownames(t5t1_return2[t5t1_return2$Direction == "Down",]), "Color" = "#0000FF", "Width" = "W20")
+irrigation.ipath.T1$KO <- gsub("ko:", "", irrigation.ipath.T1$KO) %>% gsub('\\"', '', .)
+
+# Write these as tables for iPATH.
+  # Single columns.
+# write.table(depth.ipath.15to25, file = "iPATH/deepsoil_enriched.txt", sep = " ", row.names = FALSE, col.names = FALSE)
+# write.table(depth.ipath.0to5, file = "iPATH/shallowsoil_enriched.txt", sep = " ", row.names = FALSE, col.names = FALSE)
+# write.table(irrigation.ipath.T5, file = "iPATH/drought_enriched.txt", sep = " ", row.names = FALSE, col.names = FALSE)
+# write.table(irrigation.ipath.T1, file = "iPATH/irrigated_enriched.txt", sep = " ", row.names = FALSE, col.names = FALSE)
+
+  # Combining the two depth levels together into one, as well as the two irrigation levels together into another one.
+# write.table(rbind(depth.ipath.0to5, depth.ipath.15to25), file = "iPATH/bothdepths_enriched.txt", sep = " ", row.names = FALSE, col.names = FALSE)
+# write.table(rbind(irrigation.ipath.T1, irrigation.ipath.T5), file = "iPATH/bothirrigationlevels_enriched.txt", sep = " ", row.names = FALSE, col.names = FALSE)
+
+
+```
