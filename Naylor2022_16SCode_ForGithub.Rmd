@@ -1,0 +1,3220 @@
+---
+title: "16S Code for Soil Depth Study - Code for Github"
+author: "Dan Naylor"
+date: "10/01/2022"
+output: html_document
+---
+
+What is the point of this document?
+
+This experiment was investigating the microbial communities of soil (and rhizosphere) in a Prosser field site with wheatgrass
+cultivated under four different irrigation regimes, collected at three depths (0-5 cm, 5-15 cm, and 15-25 cm), with three biological
+replicates, and at sites next to two different wheatgrass cultivars (Alkar and Jose). Furthermore, there were three sampling dates,
+one in April prior to any differential irrigation, one in early July before the first wheatgrass harvest, and one in the middle of
+October at the peak of drought. Though note that no rhizosphere samples were taken from the April date. Also, there are some bare
+soil samples used as control, though there were three depths taken.
+
+### 0) Setup.
+
+## 0.1) Load packages.
+
+```{r 0.1-setup-checkpoint, results='hide', warning=F, echo = FALSE, message=FALSE}
+
+#############################################################################
+### Loading all of the R packages that we will be using in this analysis. ###
+#############################################################################
+
+library("knitr")
+library("stringr")
+library("rmarkdown")
+library("ggplot2")
+library("reshape2")
+library("RColorBrewer")
+library("viridis")
+library("vegan")
+library("betapart")
+library("multcomp")
+library("tidyr")
+library("broom")
+library("dplyr")
+library("ztable")
+library("cowplot")
+library("gplots")
+library("eulerr")
+library("agricolae")
+library("labdsv")
+library("colorspace")
+library('energy')
+library('scales')
+library('spaa')
+library('igraph')
+library('picante')
+library('data.table')
+library('plyr')
+library('pheatmap')
+library('ggplotify')
+library("writexl")
+library('polycor')
+library('Rmisc')
+library("DESeq2")
+library('phyloseq')
+library('Hmisc')
+library('Matrix')
+
+knitr::opts_chunk$set(root.dir = "/Users/dtnaylor/Documents/06142022/16S_Rcode/analysis/")
+
+theme_set(theme_bw() + theme(strip.background = element_blank()))
+
+set.seed(711)
+knitr::opts_chunk$set(cache=TRUE)
+
+load("../workspaceimages/010032022.RData")
+# save.image("../workspaceimages/010032022.RData")
+
+```
+
+
+## 0.2) Downloading data and making the metadata file.
+
+```{r 0.2-making-metadata}
+
+# My personal rule: include all the relevant metadata information inside the sample names of this OTU object. 
+# In that way, you can reconstruct a metadata table easily by simply dissecting the sample names.
+
+#####################################################################
+### Importing all the data necessary to make the phyloseq object. ###
+#####################################################################
+
+# Import the biom and tax information for the 16s data. Modify the extensions appropriately to where you store your data.
+no_meta.16s <- import_biom("../data/OTU.biom", "../data/OTU.tree")
+
+# Make a copy of this data object in case we irreparably modify the working version and need to regenerate it.
+no_meta.16s.copy <- no_meta.16s
+no_meta.16s <- no_meta.16s.copy
+
+# Rename the samples to be compatible with the downstream separation into different columns. We want our separators to be underscores, and we want there to be an equivalent
+# number of columns for all samples.
+sample_names(no_meta.16s) <- sample_names(no_meta.16s) %>%
+  gsub("0_5cm", "0-5cm", .) %>% gsub("5_15cm", "5-15cm", .) %>% gsub("15_25cm", "15-25cm", .) %>%
+  gsub("_BareSoil_T5", "", .) %>% gsub("10162020", "10152020", .) %>%
+  gsub("ControlSoil(\\d)", "ControlSoil\\1_BareSoil_T5", .) %>% gsub("0708", "0707", .) 
+
+# Note for date: we harvested rhizosphere / bulk soil on consecutive days, I'm making them one date here.
+
+# Another note on this code: the (\\d) matches ANY number, then in the replacement the \\1 retains that same number to replace it with. See below for context.
+
+###################################################################################################
+### Make a dataframe from the sample names and separate the information into different columns. ###
+###################################################################################################
+
+df.names <- data.frame(Names = sample_names(no_meta.16s)) %>%
+  separate(col = Names, c("Name", "FieldPosition", "Cultivar", "Irrigation", "Depth", "Date", "SampleType"), sep = "_")
+rownames(df.names) <- sample_names(no_meta.16s)
+
+# Add in factor levels.
+df.names$Cultivar <- factor(df.names$Cultivar, levels = c("BareSoil", "Alkar", "Jose"))
+df.names$Irrigation <- factor(df.names$Irrigation, levels = sort(unique(df.names$Irrigation)))
+df.names$Depth <- factor(df.names$Depth, levels = c("0-5cm", "5-15cm", "15-25cm"))
+df.names$Date <- as.character(df.names$Date) %>% factor(., levels = sort(unique(.)))
+df.names$SampleType <- factor(df.names$SampleType, levels = sort(unique(df.names$SampleType)))
+df.names$SampleType_Irrigation <- with(df.names, interaction(df.names$SampleType,df.names$Irrigation)) %>%
+  factor(., levels = c("BulkSoil.T1","BulkSoil.T2", "BulkSoil.T3","BulkSoil.T4", "BulkSoil.T5",
+                       "Rhizosphere.T1", "Rhizosphere.T2", "Rhizosphere.T3", "Rhizosphere.T4", "Rhizosphere.T5"))
+
+
+# Assigning this dataframe as the sample data within the phyloseq object.
+meta.16s <- no_meta.16s
+sample_data(meta.16s) <- sample_data(df.names)
+
+# Add in the rankings to the taxonomic table.
+colnames(tax_table(meta.16s)) <- c("Domain", "Phylum", "Class", "Order", "Family", "Genus", "Species")
+  
+# If the taxa is labeled with a prefix (e.g. p__Proteobacteria rather than Proteobacteria), we can get rid of that here.
+tax_table(meta.16s)[,] <- gsub("^.__", "", tax_table(meta.16s)[,])
+
+# We have some samples that were extracted twice and we can remove the original sample here.
+meta.16s <- subset_samples(meta.16s, !sample_names(meta.16s) %in% c("DN_18_Alkar_T4_5-15cm_10152020_BulkSoil",
+                                                                    "DN_31_Alkar_T1_5-15cm_10152020_BulkSoil",
+                                                                    "DN_34_Jose_T2_5-15cm_10152020_BulkSoil",
+                                                                    "DN_37_Jose_T3_5-15cm_10152020_BulkSoil",
+                                                                    "DN_38_Alkar_T4_5-15cm_10152020_BulkSoil"))
+
+#################################################
+### Rarefying the dataset for downstream use. ###
+#################################################
+
+rardepth <- 3750
+rar.16s <- rarefy_even_depth(meta.16s, sample.size = rardepth, rngseed = 711)
+# We can modify the rarefaction depth later as needed.
+
+```
+
+## 0.3) Relative water content.
+
+We collected data for gravimetric water content for all soil samples (fresh weight of soil / dry weight soil) to see
+how effective the watering regimes were in differentiating between soil water content levels.
+
+```{r 0.3-relative-water-content}
+
+# Import the tables with relative water content included.
+rwc <- read.table("../data/RWC.txt", header = TRUE, sep = "\t", row.names = 1) %>% select(., -TubeWeight, -FreshWeight, -DryWeight)
+
+###################################################################################
+### Using ANOVA to determine the significances of RWC based on various factors. ###
+###################################################################################
+
+# For the overall dataset:
+overall.rwcmodel <- summary(aov(RWC ~ Irrigation * Depth * Date + Cultivar, data = rwc))
+# View(overall.rwcmodel[[1]])
+  # CONCLUSION => Irrigation and Date are significant. Depth is almost significant (p = 0.0953)
+overall.rwcmodel.nocontrol <- summary(aov(RWC ~ Irrigation * Depth * Date + Cultivar, data = rwc[rwc$Irrigation != "T5",]))
+# View(overall.rwcmodel.nocontrol[[1]])
+  # CONCLUSION => excluding controls makes "Irrigation", "Depth" significant.
+
+
+# For April only (before differential irrigation was put in place)
+april.rwcmodel <- summary(aov(RWC ~ Irrigation * Depth + Cultivar, data = rwc[rwc$Date == "4292020",]))
+# View(april.rwcmodel[[1]])
+  # CONCLUSION => Irrigation is highly significant; Irrigation*Depth is also significant.
+april.rwcmodel.nocontrol <- summary(aov(RWC ~ Irrigation * Depth + Cultivar, data = rwc[rwc$Date == "4292020" & rwc$Irrigation != "T5",]))
+# View(april.rwcmodel.nocontrol[[1]])
+  # CONCLUSION => removing controls makes nothing significant.
+
+
+# For July only.
+july.rwcmodel <- summary(aov(RWC ~ Irrigation * Depth + Cultivar, data = rwc[rwc$Date == "7072020",]))
+View(july.rwcmodel[[1]])
+  # CONCLUSION => Irrigation is highly significant.
+july.rwcmodel.nocontrol <- summary(aov(RWC ~ Irrigation * Depth + Cultivar, data = rwc[rwc$Date == "7072020" & rwc$Irrigation != "T5",]))
+View(july.rwcmodel.nocontrol[[1]])
+  # CONCLUSION => Irrigation is still highly significant.
+
+# For October only.
+oct.rwcmodel <- summary(aov(RWC ~ Irrigation * Depth + Cultivar, data = rwc[rwc$Date == "10152020",]))
+# View(oct.rwcmodel[[1]])
+  # CONCLUSION => Irrigation and Depth are significant; Cultivar and Irrigation:Depth are not.
+oct.rwcmodel.nocontrol <- summary(aov(RWC ~ Irrigation * Depth + Cultivar, data = rwc[rwc$Date == "10152020" & rwc$Irrigation != "T5",]))
+# View(oct.rwcmodel.nocontrol[[1]])
+  # CONCLUSION => Irrigation and Depth are still significant; Cultivar and Irrigation:Depth are still not significant.
+
+###############################
+### Tukey's post-hoc tests. ###
+###############################
+
+tukey.overall.rwc.irr <- HSD.test(aov(RWC ~ Irrigation * Depth * Date + Cultivar, data = rwc), "Irrigation", group = TRUE)
+# Groups: T1 and T2 are a, T3 and T4 are b, T5 is c.
+tukey.overall.rwc.depth <- HSD.test(aov(RWC ~ Irrigation * Depth * Date + Cultivar, data = rwc), "Depth", group = TRUE)
+# All depths are in group a.
+
+tukey.april.rwc.irr <- HSD.test(aov(RWC ~ Irrigation * Depth + Cultivar, data = rwc[rwc$Date == "4292020",]), "Irrigation", group = TRUE)
+# Groups: T1-T4 are a, T5 is b.
+tukey.april.rwc.depth <- HSD.test(aov(RWC ~ Irrigation * Depth + Cultivar, data = rwc[rwc$Date == "4292020",]), "Depth", group = TRUE)
+# All depths are in group a.
+
+tukey.july.rwc.irr <- HSD.test(aov(RWC ~ Irrigation * Depth + Cultivar, data = rwc[rwc$Date == "7072020",]), "Irrigation", group = TRUE)
+# Groups: T1 and T2 are a, T3 is b, T4 is bc, and T5 is c.
+tukey.july.rwc.depth <- HSD.test(aov(RWC ~ Irrigation * Depth + Cultivar, data = rwc[rwc$Date == "7072020",]), "Depth", group = TRUE)
+# All depths are in group a.
+
+tukey.oct.rwc.irr <- HSD.test(aov(RWC ~ Irrigation * Depth + Cultivar, data = rwc[rwc$Date == "10152020",]), "Irrigation", group = TRUE)
+# Groups: T1 and T2 are a, T3 is ab, T4 is bc, and T5 is c.
+tukey.oct.rwc.depth <- HSD.test(aov(RWC ~ Irrigation * Depth + Cultivar, data = rwc[rwc$Date == "10152020",]), "Depth", group = TRUE)
+# Groups: 0-5 cm is a, 5-15 cm is ab, and 15-25 cm is b.
+
+########################################################################
+### Supplemental Figure 2 - Density plots of relative water content. ###
+########################################################################
+
+# Relabel the factor levels for Date to be the actual months.
+rwc$Date <- factor(rwc$Date, levels = c("4292020", "7072020", "10152020"))
+levels(rwc$Date) <- c("April", "July", "October")
+
+# Make a palette for the densities.
+st.ir_palette <- c(brewer.pal(9, "Reds")[c(2,4,6,8,9)], brewer.pal(9, "Blues")[c(2,4,6,8,9)])
+
+# Make separate plots for relative content with samples segregated by irrigation or by depth.
+rwc.byirr <- ggplot(rwc, aes(RWC, fill = Irrigation)) + geom_density(alpha = 0.4) + facet_grid(Date ~ .) + scale_fill_manual(values = st.ir_palette[1:5]) +
+  xlim(1.0, 1.4) + ggtitle("Relative Water Content\nBy Irrigation") + theme(plot.title = element_text(hjust = 0.5))
+
+rwc.bydepth <- ggplot(rwc, aes(RWC, fill = Depth)) + geom_density(alpha = 0.4) + facet_grid(Date ~ .) +
+  scale_fill_manual(values = viridis(3)) + xlim(1.0, 1.4) + ggtitle("Relative Water Content\nBy Depth") + theme(plot.title = element_text(hjust = 0.5))
+
+################################
+### Plots for each of these. ###
+################################
+
+plot_grid(rwc.byirr, rwc.bydepth, ncol = 2, labels = c("A)", "B)")) %>%
+  ggsave("../submission_figures/SupplementalFigure2.jpg",
+            plot = ., height = 6, width = 8, scale = 1.1, dpi = 400)
+
+
+```
+
+
+### 1) Alpha-Diversity Metrics.
+
+One of the first questions we want to answer is, how do diversity metrics vary as a function of Irrigation or Depth,
+and in turn does this variation matter depending on the date considered? 
+
+In particular, the April timepoint was prior to any differential irrigation regime,
+so the effect size of 'Irrigation' should be substantially less at this date compared to the later dates.
+
+## 1.1) Setting up the starting diversity tables.
+
+We're going to want to make tables of diversity both including and excluding control samples.
+
+```{r 1.1-generating-diversity-tables}
+
+# Generate a dataframe that has the relevant diversity metrics for all samples.
+df.diversity <- cbind(data.frame(sample_data(rar.16s)), estimate_richness(rar.16s, measures = c("Shannon", "Simpson", "Observed")))
+
+# Make a subset without the control samples. These are unplanted, non-irrigated soils outside of the main plot. Their inclusion, while a good point
+# of comparison, may artificially enhance the significance of the 'Irrigation' effect.
+df.diversity.nocontrol <- df.diversity[df.diversity$Irrigation != "T5",]
+
+```
+
+
+# 1.1.1) Diversity Subsets / ANOVA Functions
+
+For ease of use, it would be helpful to have a function that takes in a diversity table,
+allows you to specify a subset of that data, and a formula to then calculate an ANOVA statistic.
+
+```{r 1.1.1-diversity-function}
+
+####################################################################################
+### Here we're creating a function that can take a data frame, specify a subset, ###
+### then calculate an ANOVA for the three main diversity metrics we're using.    ###
+####################################################################################
+
+# By default, this function will calculate the ANOVA for the full dataset;
+# you have to specify a particular date and/or sampletype to focus on.
+sig_diversity <- function(df, date.subset = NA, sampletype.subset = NA, depth.subset = NA){
+  
+  # Initialize the variables we'll be using inside the function.
+  varlist <- c("Date", "Irrigation", "Depth")
+  varlist2 <- c("Cultivar", "SampleType")
+  printdate <- "All Dates"
+  printsampletype <- "All SampleTypes"
+  printdepth <- "All Depths"
+  
+  # If we're only considering one date, we can get rid of all other dates in the dataset and remove 'Date' as a factor of interest.
+  if(!is.na(date.subset)){
+    df <- subset(df, Date == date.subset)
+    varlist <- varlist[varlist != "Date"]
+    printdate <- paste(date.subset, "Only", sep = " ")
+  }
+  
+  if(!is.na(depth.subset)){
+    df <- subset(df, Depth == depth.subset)
+    varlist <- varlist[varlist != "Depth"]
+    printdepth <- paste(depth.subset, "Only", sep = " ")
+  }
+  
+  # Similar for SampleType.
+  if(!is.na(sampletype.subset)){
+    df <- subset(df, SampleType == sampletype.subset)
+    varlist2 <- varlist2[varlist2 != "SampleType"]
+    printsampletype <- paste(sampletype.subset, "Only", sep = " ")
+  }
+  
+  # Note that April is missing rhizosphere samples, so we have to make a subset for that as well.
+  if(!is.na(date.subset) & date.subset == "04292020"){
+    varlist2 <- varlist2[varlist2 != "SampleType"]
+    printsampletype <- "Bulk Soil Only"
+  }
+  
+  # Make a string that includes all the variables we're considering as potential explanatory variables for the diversity metric.
+  # Note that we may have reduced this list earlier in this function, depending on the particular subset of the data table we may be considering.
+  var <- paste(varlist, collapse = " * ")
+  var2 <- varlist2
+  if(length(varlist2) > 1){
+    var2 <- paste(varlist2, collapse = " + ")
+  }
+  var3 <- paste(c(var, var2), collapse = " + ")
+  print(var3)
+  
+  # Now to generate the ANOVAs. Note that this outputs the ANOVA summary to the console,
+  # and doesn't save it as an object.
+  return.list <- list()
+  for(i in c("Shannon", "Simpson", "Observed")){
+    f <- paste(i, "~", var3, sep = " ")
+    aov1 <- do.call("aov", list(formula = as.formula(f), data = quote(df)))
+    # Make a bold title for the output.
+    # title <- cat(crayon::bold(paste("\n", "Summary of", i, "Diversity for", printsampletype, "at", printdate, sep = " ")))
+    # cat(paste("\n", "\n", sep = "")) # Newlines to cleanly separate everything for readability.
+    return.list[i] <- summary(aov1)
+  }
+
+  return(return.list)
+}
+
+
+```   
+
+## 1.1.2) Run the diversity table function on the existing diversity table (which includes control).
+
+```{r 1.1.2-diversity-functions-includingcontrol}
+
+#####################################################################################################################
+### Get info for all dates. NOTE: These include control samples, so the effect of 'Irrigation' may be overstated. ###
+#####################################################################################################################
+
+# 1) All sample types, all dates.
+div.fulldataset <- sig_diversity(df.diversity)
+
+div.fulldataset.nocontrol <- sig_diversity(df.diversity.nocontrol)
+
+  # Shannon => Irrigation and SampleType are highly significant, Depth is barely significant, Date and Cultivar are not significant.
+    # Conclusion => Removing controls makes Depth significant; no other changes.
+
+  # Simpson => Irrigation and SampleType are significant. Date, Depth, and Cultivar are not.
+    # Conclusion => Removing controls makes Date and Depth slightly more significant
+    # (both around p = 0.075) but still not significant.
+
+  # Richness => Date, Irrigation, Depth, and SampleType are all highly significant. Cultivar is not.
+    # Conclusion => Removing controls does not make a difference.
+
+  # 1.1) Bulk soil only, all dates.
+div.soil <- sig_diversity(df.diversity, sampletype.subset = "BulkSoil")
+
+div.soil.nocontrol <- sig_diversity(df.diversity.nocontrol, sampletype.subset = "BulkSoil")
+
+  # Shannon => Date, Irrigation, and Depth are highly significant; Cultivar is not.
+    # Conclusion => Removing controls makes Irrigation no longer significant; no other changes.
+
+  # Simpson => Irrigation is highly significant, no other factors are.
+    # Conclusion => Removing controls changes this so Irrigation is no longer significant while Date and Depth are.
+
+  # Richness => Date, Irrigation, and Depth are highly significant; Cultivar is not.
+    # Conclusion => Removing controls makes Irrigation no longer significant.
+
+  # 1.2) Rhizosphere only, all dates.
+div.rhizo <- sig_diversity(df.diversity, sampletype.subset = "Rhizosphere") 
+# Note: we're removing controls for this as there no rhizosphere 'controls'.
+  # Shannon => Irrigation is significant, Date is '.' (p = 0.0745), Depth and Cultivar are not.
+  # Simpson => Irrigation is significant, Date is '.' (p = 0.09405), Depth and Cultivar are not.
+  # Richness => Irrigation is significant, no other factors are.
+
+```
+
+## 1.1.3) Tukey's Test - Summary Function.
+
+```{r 1.1.3-tukeys-functions-alpha-diversity}
+
+# Create a function for getting the summary for each of these diversity metrics. Again, this modifies the previous functions' code.
+# Note that this prints the Tukey's results to the console rather than saving them as a table object. 
+# This code could be modified accordingly to accomplish the latter; I chose not to due to the differing table formats.
+
+tukey_groups <- function(df, date.subset = NA, sampletype.subset = NA){
+  
+  # Initialize the variables we'll be using inside the function.
+  varlist <- c("Date", "Irrigation", "Depth", "Cultivar", "SampleType")
+  printdate <- "All Dates"
+  printsampletype <- "All SampleTypes"
+  
+  # If we're only considering one date, we can get rid of all other dates in the dataset and remove 'Date' as a factor of interest.
+  if(!is.na(date.subset)){
+    df <- subset(df, Date == date.subset)
+    varlist <- varlist[varlist != "Date"]
+    printdate <- paste(date.subset, "Only", sep = " ")
+  }
+  
+  # Similar for SampleType.
+  if(!is.na(sampletype.subset)){
+    df <- subset(df, SampleType == sampletype.subset)
+    varlist <- varlist[varlist != "SampleType"]
+    printsampletype <- paste(sampletype.subset, "Only", sep = " ")
+  }
+  
+  # Note that April is missing rhizosphere samples, so we have to make a subset for that as well
+  if(!is.na(date.subset) & date.subset == "04292020"){
+    varlist <- varlist[varlist != "SampleType"]
+    printsampletype <- "Bulk Soil Only"
+  }
+  
+  # var <- paste(varlist, collapse = " + ")
+  for(i in c("Shannon", "Simpson", "Observed")){
+    for(j in varlist){
+      f <- paste(i, "~", j, sep = " ")
+      aov1 <- do.call("aov", list(formula = as.formula(f), data = quote(df)))
+      tukey1 <- HSD.test(aov1, j, group = TRUE)
+      # Make a bold title for the output.
+      cat(crayon::bold(paste("\n", "Tukey's Groups for", i, "Diversity for", j, "for", printsampletype, "at", printdate, sep = " ")))
+      cat(paste("\n", "\n", sep = "")) # Newlines to cleanly separate everything for readability.
+      print.data.frame(as.data.frame(tukey1$groups)) 
+      # ^ Note: for whatever reason, the base print() function doesn't work correctly, need this specialized function here.
+    }
+  
+  }
+}
+
+
+```
+
+
+# 1.1.4) Get information on the significant differences between groups of factors for the diversity metrics.
+
+
+```{r 1.1.4-Tukey-groups-includingcontrol}
+
+############################################################################
+### 1) Get the Tukeys results for the full dataset without restrictions. ###
+############################################################################
+
+tukey_groups(df = df.diversity)
+
+  # 1a) Get the Tukeys results for the full dataset with bulk soil ONLY.
+
+tukey_groups(df = df.diversity, sampletype.subset = "BulkSoil")
+
+  # 1b) Get the Tukeys results for the full dataset with rhizosphere ONLY.
+
+tukey_groups(df = df.diversity, sampletype.subset = "Rhizosphere")
+
+########################################################
+### 2) Get the Tukeys results for the April dataset. ###
+########################################################
+
+tukey_groups(df = df.diversity, date.subset = "04292020")
+
+  # 2a) Get the Tukeys results for the April dataset with bulk soil ONLY. (Note: this is the same as the previous as no rhizosphere was collected in April).
+
+tukey_groups(df = df.diversity, date.subset = "04292020")
+
+#######################################################
+### 3) Get the Tukeys results for the July dataset, ###
+#######################################################
+
+tukey_groups(df = df.diversity, date.subset = "07072020")
+
+  # 3a) Get the Tukeys results for the July dataset with bulk soil ONLY.
+
+tukey_groups(df = df.diversity, date.subset = "07072020", sampletype.subset = "BulkSoil")
+
+  # 3b) Get the Tukeys results for the full dataset with rhizosphere ONLY.
+
+tukey_groups(df = df.diversity, date.subset = "07072020", sampletype.subset = "Rhizosphere")
+
+##########################################################
+### 4) Get the Tukeys results for the October dataset. ###
+##########################################################
+
+tukey_groups(df = df.diversity, date.subset = "10152020")
+
+  # 4a) Get the Tukeys results for the July dataset with bulk soil ONLY.
+
+tukey_groups(df = df.diversity, date.subset = "10152020", sampletype.subset = "BulkSoil")
+
+  # 4b) Get the Tukeys results for the full dataset with rhizosphere ONLY.
+
+tukey_groups(df = df.diversity, date.subset = "10152020", sampletype.subset = "Rhizosphere")
+
+```   
+
+
+# 1.2) Graphing the variation in ANOVA effect size.
+
+Here, we're going to graph the effect size / significance in a given ANOVA test. Specifically,
+we care about the effect of 'Irrigation' or 'Depth' on explaining alpha-diversity metrics
+(Shannon's diversity, Simpson's evenness, richness/observed OTUs) and how the size of this effect
+changes either over time OR by which sample type (all samples, bulk soil, rhizosphere) we're looking at.
+
+## 1.2.1) Generate a function for getting a summary table of each of the main diversity metrics.
+
+```{r 1.2.1-diversity-proportions-functions}
+
+######################################################################################
+### Create a function for getting the summary for each of these diversity metrics. ###
+######################################################################################
+
+# Note: this is essentially a modified version of the earlier function 'sig_diversity', just with a different output.
+anova.divtables <- function(df, date.subset = NA, sampletype.subset = NA, depth.subset = NA, irrigation.subset = NA){
+  
+  # Initialize the variables we'll be using inside the function.
+  varlist <- c("Date", "Irrigation", "Depth", "Cultivar", "SampleType")
+  printdate <- "AllDates"
+  printsampletype <- "AllSampleTypes"
+  printdepth <- "AllDepths"
+  printirrigation <- "AllIrrigationRegimes"
+  
+  # If we're only considering one date, we can get rid of all other dates in the dataset and remove 'Date' as a factor of interest.
+  if(!is.na(date.subset)){
+    df <- subset(df, Date == date.subset)
+    varlist <- varlist[varlist != "Date"]
+    printdate <- date.subset
+  }
+  
+  # Similar for SampleType.
+  if(!is.na(sampletype.subset)){
+    df <- subset(df, SampleType == sampletype.subset)
+    varlist <- varlist[varlist != "SampleType"]
+    printsampletype <- sampletype.subset
+  }
+  
+  # And for Depth.
+  if(!is.na(depth.subset)){
+    df <- subset(df, Depth == depth.subset)
+    varlist <- varlist[varlist != "Depth"]
+    printdepth <- depth.subset
+  }
+  
+  # And for Irrigation
+  if(!is.na(irrigation.subset)){
+    df <- subset(df, Irrigation == irrigation.subset)
+    varlist <- varlist[varlist != "Irrigation"]
+    if(irrigation.subset == "T5"){
+      varlist <- varlist[varlist != "Cultivar"] 
+      # T5's only have 'bulk soil' as their cultivar, i.e. one factor level, so we need to remove it as an explanatory variable.
+    }
+    printirrigation <- irrigation.subset
+  }
+  
+  
+  # Note that April is missing rhizosphere samples, so we have to make a subset for that as well
+  if(!is.na(date.subset) & date.subset == "04292020"){
+    varlist <- varlist[varlist != "SampleType"]
+    printsampletype <- "BulkSoil"
+  }
+  
+  var <- paste(varlist, collapse = " + ")
+  
+  df.return <- data.frame(Date = character(), Variable = character(), Metric = character(), SampleType = character(), Depth = character(), Sum.Sq = numeric(), p.value = numeric())
+  
+  for(i in c("Shannon", "Simpson", "Observed")){
+    f <- paste(i, "~", var, sep = " ")
+    aov1 <- do.call("aov", list(formula = as.formula(f), data = quote(df)))
+    
+    # Make a dataframe of the output. Note that converting a 'summary' object to a dataframe takes a bit of tweaking, as in the following lines of code.
+    df.aov1 <- as.data.frame(unclass(summary(aov1)))
+    colnames(df.aov1) <- str_trim(colnames(df.aov1))
+    rownames(df.aov1) <- str_trim(rownames(df.aov1))
+    
+    # We need to modify the dataframe to include all the variables by which we may want to facet data when graphing.
+    df.aov1 <- df.aov1 %>% mutate(p.value = Pr..F., Pr..F. = NULL, Sum.Sq = round(Sum.Sq / sum(Sum.Sq), 3), Variable = rownames(.), Date = printdate, Depth = printdepth, Irrigation = printirrigation,
+                                  Metric = i, SampleType = printsampletype) %>%
+      subset(., !Variable == "Residuals") %>% select(Date, Variable, Metric, SampleType, Depth, Irrigation, Sum.Sq, p.value)
+    
+    # Now add this dataset to the previous datasets, so we get results for all of the diversity metrics together.
+    df.return <- rbind(df.return, df.aov1)
+  }
+  
+  # Modify rownames to be very descriptive, and unique.
+  rownames(df.return) <- paste(df.return$Date, df.return$SampleType, df.return$Depth, df.return$Irrigation, df.return$Metric, df.return$Variable, sep = "_")
+  
+  # Return this data frame.
+  return(df.return)
+}
+
+```
+
+## 1.2.2) Using the alpha-diversity significance function to graph the effect size and significance over time for 'Irrigation'.
+
+```{r 1.2.2-irrigation-effectsize-by-depth}
+
+depthsig.collective <- rbind(anova.divtables(df = df.diversity), # Overall dataset.
+                             anova.divtables(df = df.diversity, date.subset = "04292020"),
+                             anova.divtables(df = df.diversity, date.subset = "07072020"),
+                             anova.divtables(df = df.diversity, date.subset = "10152020"),
+                             anova.divtables(df = df.diversity, date.subset = "04292020", sampletype.subset = "BulkSoil"),
+                             anova.divtables(df = df.diversity, date.subset = "07072020", sampletype.subset = "BulkSoil"),
+                             anova.divtables(df = df.diversity, date.subset = "10152020", sampletype.subset = "BulkSoil"),
+                             anova.divtables(df = df.diversity, date.subset = "07072020", sampletype.subset = "Rhizosphere"),
+                             anova.divtables(df = df.diversity, date.subset = "10152020", sampletype.subset = "Rhizosphere"),
+                             anova.divtables(df = df.diversity, depth.subset = "0-5cm"),
+                             anova.divtables(df = df.diversity, depth.subset = "5-15cm"),
+                             anova.divtables(df = df.diversity, depth.subset = "15-25cm"),
+                             anova.divtables(df = df.diversity, depth.subset = "0-5cm", sampletype.subset = "BulkSoil"),
+                             anova.divtables(df = df.diversity, depth.subset = "5-15cm", sampletype.subset = "BulkSoil"),
+                             anova.divtables(df = df.diversity, depth.subset = "15-25cm", sampletype.subset = "BulkSoil"),
+                             anova.divtables(df = df.diversity, depth.subset = "0-5cm", sampletype.subset = "Rhizosphere"),
+                             anova.divtables(df = df.diversity, depth.subset = "5-15cm", sampletype.subset = "Rhizosphere"),
+                             anova.divtables(df = df.diversity, depth.subset = "15-25cm", sampletype.subset = "Rhizosphere"),
+                             anova.divtables(df = df.diversity, depth.subset = "0-5cm",
+                                             sampletype.subset = "BulkSoil", date.subset = "04292020"),
+                             anova.divtables(df = df.diversity, depth.subset = "5-15cm",
+                                             sampletype.subset = "BulkSoil", date.subset = "04292020"),
+                             anova.divtables(df = df.diversity, depth.subset = "15-25cm",
+                                             sampletype.subset = "BulkSoil", date.subset = "04292020"),
+                             anova.divtables(df = df.diversity, depth.subset = "0-5cm",
+                                             sampletype.subset = "BulkSoil", date.subset = "07072020"),
+                             anova.divtables(df = df.diversity, depth.subset = "5-15cm",
+                                             sampletype.subset = "BulkSoil", date.subset = "07072020"),
+                             anova.divtables(df = df.diversity, depth.subset = "15-25cm",
+                                             sampletype.subset = "BulkSoil", date.subset = "07072020"),
+                             anova.divtables(df = df.diversity, depth.subset = "0-5cm",
+                                             sampletype.subset = "BulkSoil", date.subset = "10152020"),
+                             anova.divtables(df = df.diversity, depth.subset = "5-15cm",
+                                             sampletype.subset = "BulkSoil", date.subset = "10152020"),
+                             anova.divtables(df = df.diversity, depth.subset = "15-25cm",
+                                             sampletype.subset = "BulkSoil", date.subset = "10152020"),
+                             anova.divtables(df = df.diversity, depth.subset = "0-5cm",
+                                             sampletype.subset = "Rhizosphere", date.subset = "07072020"),
+                             anova.divtables(df = df.diversity, depth.subset = "5-15cm",
+                                             sampletype.subset = "Rhizosphere", date.subset = "07072020"),
+                             anova.divtables(df = df.diversity, depth.subset = "15-25cm",
+                                             sampletype.subset = "Rhizosphere", date.subset = "07072020"),
+                             anova.divtables(df = df.diversity, depth.subset = "0-5cm",
+                                             sampletype.subset = "Rhizosphere", date.subset = "10152020"),
+                             anova.divtables(df = df.diversity, depth.subset = "5-15cm",
+                                             sampletype.subset = "Rhizosphere", date.subset = "10152020"),
+                             anova.divtables(df = df.diversity, depth.subset = "15-25cm",
+                                             sampletype.subset = "Rhizosphere", date.subset = "10152020"))
+
+# Add in a significance column that species the degree to which the p-values are significant.
+depthsig.collective <- depthsig.collective %>% mutate(significance = case_when(p.value <= 0.001 ~ "***",
+                                                                               (p.value <= 0.01 & p.value > 0.001) ~ "**",
+                                                                               (p.value <= 0.05 & p.value > 0.01) ~ "*",
+                                                                               p.value > 0.05 ~ "Not Significant"))
+
+# Add in factor values.
+depthsig.collective$Date <- factor(depthsig.collective$Date, levels = c("AllDates", "04292020", "07072020", "10152020"))
+depthsig.collective$Depth <- factor(depthsig.collective$Depth, levels = c("AllDepths", "0-5cm", "5-15cm", "15-25cm"))
+depthsig.collective$significance <- factor(depthsig.collective$significance, levels = c("Not Significant", "*", "**", "***"))
+depthsig.collective$Metric <- factor(depthsig.collective$Metric, levels = c("Shannon", "Simpson", "Observed")) %>% revalue(., c("Observed" = "Richness"))
+depthsig.collective$SampleType <- factor(depthsig.collective$SampleType, levels = c("AllSampleTypes", "BulkSoil", "Rhizosphere"))
+
+```
+
+
+## 1.3) Alpha-diversity-boxplots
+
+# 1.3.1) Figure 1. 
+
+Generating a basic set of plots for Shannon's diversity and richness over irrigation or over depth, for each sampletype.
+
+```{r 1.3.1-Figure1-alpha-diversity-boxplots-irrigation-and-depth}
+
+df.diversity$SampleType_Date <- paste(df.diversity$SampleType, df.diversity$Date, sep = "\n")
+df.diversity$SampleType_Irrigation <- paste(df.diversity$SampleType, df.diversity$Irrigation, sep = "_")
+
+# Replace the dates from numbers to month names.
+levels(df.diversity$Date) <- c("April", "July", "October")
+
+st.ir_palette <- c(brewer.pal(9, "Reds")[c(2,4,6,8,9)], brewer.pal(9, "Blues")[c(2,4,6,8,9)])
+
+div.themes <- list(theme(plot.title = element_text(size = 24, hjust = 0.5, face = "bold"),
+                         axis.title = element_text(size = 20, face = "bold"),
+                         axis.text = element_text(size = 14),
+                         strip.text.x = element_text(size = 14),
+                         legend.title = element_text(size = 16),
+                         legend.text = element_text(size = 12),
+                         legend.position = "none"))
+
+div.shannonbyirrigation <- ggplot(df.diversity, aes(x = Irrigation, y = Shannon, fill = SampleType_Irrigation)) +
+  geom_boxplot() + ggtitle("Shannon's Diversity by Irrigation\n") + scale_fill_manual(values = st.ir_palette) +
+  xlab("Irrigation") + ylab("Shannon's Diversity") + facet_grid(~ SampleType_Date, scales = "free_x") +
+  coord_cartesian(ylim = c(5.8, 7)) + div.themes
+
+div.shannonbydepth <- ggplot(df.diversity, aes(x = Depth, y = Shannon, fill = Depth)) +
+  geom_boxplot() + ggtitle("\nShannon's Diversity by Depth\n") + scale_fill_manual(values = viridis(3)) +
+  xlab("Depth") + ylab("Shannon's Diversity") + facet_grid(~ SampleType_Date, scales = "free_x") +
+  coord_cartesian(ylim = c(5.8, 7)) + div.themes + theme(axis.text.x = element_text(angle = 45, vjust = 0.5))
+
+div.richnessbyirrigation <- ggplot(df.diversity, aes(x = Irrigation, y = Observed, fill = SampleType_Irrigation)) +
+  geom_boxplot() + ggtitle("Richness by Irrigation\n") + scale_fill_manual(values = st.ir_palette) +
+  xlab("Irrigation") + ylab("Richness") + facet_grid(~ SampleType_Date, scales = "free_x") + div.themes
+
+div.richnessbydepth <- ggplot(df.diversity, aes(x = Depth, y = Observed, fill = Depth)) +
+  geom_boxplot() + ggtitle("\nRichness by Depth\n") + scale_fill_manual(values = viridis(3)) +
+  xlab("Depth") + ylab("Richness") + facet_grid(~ SampleType_Date, scales = "free_x") + div.themes + theme(axis.text.x = element_text(angle = 45, vjust = 0.5))
+
+# Make and save the plot.
+plot_grid(div.shannonbyirrigation, div.richnessbyirrigation, div.shannonbydepth, div.richnessbydepth,
+          ncol = 2, rel_heights = c(0.95, 1.05),
+          labels = c("A)", "B)", "C)", "D)"), label_size = 20) %>%
+  ggsave("../submission_figures/Figure1.jpg",
+         plot = ., width = 16, height = 10, scale = 1.1, dpi = 400)
+
+
+```
+
+# 1.3.2) Supplemental Figure 3.
+
+Generating a new set of plots for Shannon's diversity and richness over irrigation or over depth for each sampletype.
+
+NOTE: you need to run section 2.3.2 before running this code block!
+
+```{r 1.3.2-SupplementalFigure3-alpha-diversity-boxplots-irrigation-by-depth}
+
+# Add in a significance column that species the degree to which the p-values are significant.
+depthsig.collective4 <- depthsig.collective
+
+depthsig.collective4 <- depthsig.collective4 %>% mutate(significance = case_when(p.value <= 0.001 ~ "***",
+                                                                               (p.value <= 0.01 & p.value > 0.001) ~ "**",
+                                                                               (p.value <= 0.05 & p.value > 0.01) ~ "*",
+                                                                               p.value > 0.05 ~ "Not Significant")) %>%
+  mutate(Sum.Sq = PctVar)
+
+# Add in factor values.
+depthsig.collective4$Date <- factor(depthsig.collective4$Date, levels = c("AllDates", "04292020", "07072020", "10152020"))
+levels(depthsig.collective4$Date) <- c("AllDates", "April", "July", "October")
+depthsig.collective4$Depth <- factor(depthsig.collective4$Depth, levels = c("AllDepths", "0-5cm", "5-15cm", "15-25cm"))
+depthsig.collective4$significance <- factor(depthsig.collective4$significance, levels = c("Not Significant", "*", "**", "***"))
+depthsig.collective4$Metric <- factor(depthsig.collective4$Metric, levels = c("Shannon", "Simpson", "Richness")) 
+depthsig.collective4$SampleType <- factor(depthsig.collective4$SampleType, levels = c("AllSampleTypes", "BulkSoil", "Rhizosphere"))
+
+# Add in factor levels to the Bray table.
+permtables.depth.bray_control2 <- permtables.depth.bray_control %>% mutate(Metric = Distance) %>% select(., Date, Variable, Metric, SampleType, Depth, PctVar, p.value, significance)
+
+permtables.depth.bray_control2$Date <- factor(permtables.depth.bray_control2$Date,
+                                              levels = c("AllDates", "04292020", "07072020", "10152020"))
+
+levels(permtables.depth.bray_control2$Date) <- c("AllDates", "April", "July", "October")
+
+effectsize.collective <- rbind(select(depthsig.collective4, -Sum.Sq), permtables.depth.bray_control2)
+
+# List of themes for the plot.
+nl <- list(theme(plot.title = element_text(size = 24, hjust = 0.5, face = "bold"),
+                         axis.title = element_text(size = 20, face = "bold"),
+                         axis.text = element_text(size = 14),
+                         strip.text.x = element_text(size = 14),
+                         legend.title = element_text(size = 16),
+                         legend.text = element_text(size = 12),
+                         legend.position = "none"))
+
+effectsizes.irrigation_barplot <- ggplot(data=effectsize.collective[effectsize.collective$Variable == "Irrigation" & 
+                                                                              effectsize.collective$SampleType != "AllSampleTypes" &
+                                                                              effectsize.collective$Date != "AllDates" &
+                                                                      effectsize.collective$Metric != "Simpson",],
+                                         aes(x=Date,y=PctVar, fill=significance)) +
+  geom_bar(stat="identity", position = "dodge", colour = "black") +
+  facet_grid(Metric ~ SampleType + Depth, scales = "free_x") +
+  scale_fill_manual(values = c("white", brewer.pal(4, "Greys")[c(2:4)]), drop = FALSE) +
+  theme(axis.text.x=element_text(size = 16, color = "black", angle = 60, hjust = 1),
+        axis.text.y=element_text(size=16,color="black"),
+        axis.title.y=element_text(size=16,face="bold"),
+        axis.title.x = element_blank(), strip.background = element_rect(color = "black", fill = "grey90"),
+        text=element_text(size=24), plot.title = element_text(size = 36, face = "bold", hjust = 0.5)) +
+  xlab("Date") + ylab("% Variance Explained") + theme(panel.spacing = unit(1, "lines")) +
+  theme(legend.text = element_text(size = 16), legend.position = "bottom") + ggtitle("Effect Size of Irrigation by Depth and SampleType\n")
+
+# Save the plot.
+ggsave("../submission_figures/SupplementalFigure3.jpg",
+          plot = effectsizes.irrigation_barplot + nl, width = 12, height = 10, scale = 1.1, dpi = 400)
+
+
+```
+
+
+### 2) Beta-Diversity Trends
+
+## 2.1) Getting the PERMANOVA tables for overall significances of experimental factors.
+
+
+```{r 2.1.1-permanova-toplevel-analysis}
+
+# Generate the distance objects.
+bray.16s <- distance(rar.16s, method = "bray")
+bray.16s.soil <- distance(subset_samples(rar.16s, SampleType == "BulkSoil"), method = "bray")
+bray.16s.soil.nocontrol <- distance(subset_samples(rar.16s, SampleType == "BulkSoil" & Irrigation != "T5"), method = "bray")
+bray.16s.rhizo <- distance(subset_samples(rar.16s, SampleType == "Rhizosphere"), method = "bray")
+
+# Generate the metadata for each subset.
+full.metadata <- data.frame(sample_data(rar.16s))
+soil.metadata <- data.frame(sample_data(subset_samples(rar.16s, SampleType == "BulkSoil")))
+soilnocontrol.metadata <- data.frame(sample_data(subset_samples(rar.16s, SampleType == "BulkSoil" & Irrigation != "T5")))
+rhizo.metadata <- data.frame(sample_data(subset_samples(rar.16s, SampleType == "Rhizosphere")))
+
+# Get the significances for the major factors and their combinations.
+bray_permanova.overall <- adonis2(bray.16s ~ Irrigation * Date * Depth + Cultivar + SampleType, data = full.metadata)
+View(bray_permanova.overall$aov.tab)
+
+# Get the significances for the major factors and their combinations in bulk soils only.
+bray_permanova.soil <- adonis2(bray.16s.soil ~ Irrigation * Date * Depth + Cultivar, data = soil.metadata)
+View(bray_permanova.soil$aov.tab)
+
+# Get the significances for the major factors and their combinations in bulk soils only, omitting the soil controls.
+bray_permanova.soil.nocontrol <- adonis2(bray.16s.soil.nocontrol ~ Irrigation * Date * Depth + Cultivar, data = soilnocontrol.metadata)
+View(bray_permanova.soil.nocontrol$aov.tab)
+
+# Get the significances for the major factors and their combinations.
+bray_permanova.rhizo <- adonis2(bray.16s.rhizo ~ Irrigation * Date * Depth * Cultivar, data = rhizo.metadata)
+View(bray_permanova.rhizo$aov.tab)
+
+######################################################################################
+## Check the irrigation*depth effect for each individual timepoint in soil samples. ##
+######################################################################################
+
+bray.16s.soil <- distance(subset_samples(rar.16s, SampleType == "BulkSoil"), method = "bray")
+bray.16s.soil.metadata <- data.frame(sample_data(subset_samples(rar.16s, SampleType == "BulkSoil")))
+
+bray.16s.soil.april <- distance(subset_samples(rar.16s, SampleType == "BulkSoil" & Date == "04292020"), method = "bray")
+bray.16s.soil.april.metadata <- data.frame(sample_data(subset_samples(rar.16s, SampleType == "BulkSoil" & Date == "04292020")))
+
+bray.16s.soil.july <- distance(subset_samples(rar.16s, SampleType == "BulkSoil" & Date == "07072020"), method = "bray")
+bray.16s.soil.july.metadata <- data.frame(sample_data(subset_samples(rar.16s, SampleType == "BulkSoil" & Date == "07072020")))
+
+bray.16s.soil.oct <- distance(subset_samples(rar.16s, SampleType == "BulkSoil" & Date == "10152020"), method = "bray")
+bray.16s.soil.oct.metadata <- data.frame(sample_data(subset_samples(rar.16s, SampleType == "BulkSoil" & Date == "10152020")))
+
+soil.adonis <- adonis2(bray.16s.soil ~ Irrigation*Depth*Date + Cultivar, data = bray.16s.soil.metadata)
+soil.adonis$aov.tab
+
+april.soil.adonis <- adonis2(bray.16s.soil.april ~ Irrigation * Depth + Cultivar, data = bray.16s.soil.april.metadata)
+april.soil.adonis$aov.tab # Irrigation*Depth is not significant (p = 0.204) and the R2 is 0.09988.
+
+july.soil.adonis <- adonis2(bray.16s.soil.july ~ Irrigation * Depth + Cultivar, data = bray.16s.soil.july.metadata)
+july.soil.adonis$aov.tab # Irrigation*Depth is significant (p = 0.003) and R2 value is 0.111.
+
+oct.soil.adonis <- adonis2(bray.16s.soil.oct ~ Irrigation * Depth + Cultivar, data = bray.16s.soil.oct.metadata)
+oct.soil.adonis$aov.tab # Irrigation*Depth is not significant (p = 0.336) and the R2 value is 0.087.
+
+## CONCLUSION => the July timepoint has the most pronounced / only significant Irrigation:Depth effect (when separating out soil samples by individual timepoints).
+
+```
+
+```{r 2.1.2-rhizosphere-irrigation-by-depth-significances}
+
+#############################################################################################
+## Check the irrigation*depth effect for each individual timepoint in rhizosphere samples. ##
+#############################################################################################
+
+bray.16s.rhizo <- distance(subset_samples(rar.16s, SampleType == "Rhizosphere"), method = "bray")
+bray.16s.rhizo.metadata <- data.frame(sample_data(subset_samples(rar.16s, SampleType == "Rhizosphere")))
+
+bray.16s.rhizo.july <- distance(subset_samples(rar.16s, SampleType == "Rhizosphere" & Date == "07072020"), method = "bray")
+bray.16s.rhizo.july.metadata <- data.frame(sample_data(subset_samples(rar.16s, SampleType == "Rhizosphere" & Date == "07072020")))
+
+bray.16s.rhizo.oct <- distance(subset_samples(rar.16s, SampleType == "Rhizosphere" & Date == "10152020"), method = "bray")
+bray.16s.rhizo.oct.metadata <- data.frame(sample_data(subset_samples(rar.16s, SampleType == "Rhizosphere" & Date == "10152020")))
+
+rhizo.adonis <- adonis2(bray.16s.rhizo ~ Irrigation*Depth*Date + Cultivar, data = bray.16s.rhizo.metadata)
+rhizo.adonis$aov.tab # Irrigation:Depth is NOT significant (p = 1.000)
+
+july.rhizo.adonis <- adonis2(bray.16s.rhizo.july ~ Irrigation * Depth + Cultivar, data = bray.16s.rhizo.july.metadata)
+july.rhizo.adonis$aov.tab # Irrigation*Depth is NOT significant (p = 0.998).
+
+oct.rhizo.adonis <- adonis2(bray.16s.rhizo.oct ~ Irrigation * Depth + Cultivar, data = bray.16s.rhizo.oct.metadata)
+oct.rhizo.adonis$aov.tab # Irrigation*Depth is NOT significant (p = 1.000).
+
+## CONCLUSION => the July timepoint has the most pronounced / only significant Irrigation:Depth effect (when separating out soil samples by individual timepoints).
+## Bring this point up in the text.
+
+```
+
+```{r 2.1.3-effects-by-cultivar}
+
+#####################################################################################
+## Check the cultivar effect for each individual timepoint in rhizosphere samples. ##
+#####################################################################################
+
+bray.16s.rhizo <- distance(subset_samples(rar.16s, SampleType == "Rhizosphere"), method = "bray")
+bray.16s.rhizo.metadata <- data.frame(sample_data(subset_samples(rar.16s, SampleType == "Rhizosphere")))
+
+bray.16s.rhizo.july <- distance(subset_samples(rar.16s, SampleType == "Rhizosphere" & Date == "07072020"), method = "bray")
+bray.16s.rhizo.july.metadata <- data.frame(sample_data(subset_samples(rar.16s, SampleType == "Rhizosphere" & Date == "07072020")))
+
+bray.16s.rhizo.oct <- distance(subset_samples(rar.16s, SampleType == "Rhizosphere" & Date == "10152020"), method = "bray")
+bray.16s.rhizo.oct.metadata <- data.frame(sample_data(subset_samples(rar.16s, SampleType == "Rhizosphere" & Date == "10152020")))
+
+rhizo.adonis <- adonis2(bray.16s.rhizo ~ Irrigation * Depth * Date + Cultivar, data = bray.16s.rhizo.metadata)
+rhizo.adonis$aov.tab # Cultivar is NOT significant (p = 0.052)
+
+july.rhizo.adonis <- adonis2(bray.16s.rhizo.july ~ Irrigation * Depth + Cultivar, data = bray.16s.rhizo.july.metadata)
+july.rhizo.adonis$aov.tab # Cultivar is NOT significant (p = 0.057).
+
+oct.rhizo.adonis <- adonis2(bray.16s.rhizo.oct ~ Irrigation * Depth + Cultivar, data = bray.16s.rhizo.oct.metadata)
+oct.rhizo.adonis$aov.tab # Cultivar is very NOT significant (p = 0.294).
+
+#############################################################################################
+## Check the irrigation*depth effect for each individual timepoint in rhizosphere samples. ##
+#############################################################################################
+
+bray.16s.alkar <- distance(subset_samples(rar.16s, SampleType == "Rhizosphere" & Cultivar == "Alkar"), method = "bray")
+bray.16s.alkar.metadata <- data.frame(sample_data(subset_samples(rar.16s, SampleType == "Rhizosphere" & Cultivar == "Alkar")))
+
+bray.16s.alkar.july <- distance(subset_samples(rar.16s, SampleType == "Rhizosphere" & Cultivar == "Alkar" & Date == "07072020"), method = "bray")
+bray.16s.alkar.july.metadata <- data.frame(sample_data(subset_samples(rar.16s, SampleType == "Rhizosphere" & Cultivar == "Alkar" & Date == "07072020")))
+
+bray.16s.alkar.oct <- distance(subset_samples(rar.16s, SampleType == "Rhizosphere" & Cultivar == "Alkar" & Date == "10152020"), method = "bray")
+bray.16s.alkar.oct.metadata <- data.frame(sample_data(subset_samples(rar.16s, SampleType == "Rhizosphere" & Cultivar == "Alkar" & Date == "10152020")))
+
+bray.16s.jose <- distance(subset_samples(rar.16s, SampleType == "Rhizosphere" & Cultivar == "Jose"), method = "bray")
+bray.16s.jose.metadata <- data.frame(sample_data(subset_samples(rar.16s, SampleType == "Rhizosphere" & Cultivar == "Jose")))
+
+bray.16s.jose.july <- distance(subset_samples(rar.16s, SampleType == "Rhizosphere" & Cultivar == "Jose" & Date == "07072020"), method = "bray")
+bray.16s.jose.july.metadata <- data.frame(sample_data(subset_samples(rar.16s, SampleType == "Rhizosphere" & Cultivar == "Jose" & Date == "07072020")))
+
+bray.16s.jose.oct <- distance(subset_samples(rar.16s, SampleType == "Rhizosphere" & Cultivar == "Jose" & Date == "10152020"), method = "bray")
+bray.16s.jose.oct.metadata <- data.frame(sample_data(subset_samples(rar.16s, SampleType == "Rhizosphere" & Cultivar == "Jose" & Date == "10152020")))
+
+# Alkar significances.
+
+alkar.adonis <- adonis2(bray.16s.alkar ~ Irrigation * Depth * Date, data = bray.16s.alkar.metadata)
+alkar.adonis$aov.tab # Irrigation and Date are significant, Depth is not, for all Alkar samples.
+                      # Irrigation R2 = 0.10591.
+
+alkar.july.adonis <- adonis2(bray.16s.alkar.july ~ Irrigation * Depth, data = bray.16s.alkar.july.metadata)
+alkar.july.adonis$aov.tab # Irrigation is barely significant (p = 0.051) and Depth is not nor is their interaction, for July Alkar samples.
+
+alkar.oct.adonis <- adonis2(bray.16s.alkar.oct ~ Irrigation * Depth, data = bray.16s.alkar.oct.metadata)
+alkar.oct.adonis$aov.tab # Irrigation is highly significant (p = 0.001) and Depth is not nor is their interaction, for October Alkar samples.
+
+# Jose significances.
+
+jose.adonis <- adonis2(bray.16s.jose ~ Irrigation * Depth * Date, data = bray.16s.jose.metadata)
+jose.adonis$aov.tab # Irrigation and Date are significant, Depth is not, for all Jose samples.
+
+jose.july.adonis <- adonis2(bray.16s.jose.july ~ Irrigation * Depth, data = bray.16s.jose.july.metadata)
+jose.july.adonis$aov.tab # Irrigation is highly significant (p = 0.001) but Depth is not nor is their interaction, for July Jose samples.
+
+jose.oct.adonis <- adonis2(bray.16s.jose.oct ~ Irrigation * Depth, data = bray.16s.jose.oct.metadata)
+jose.oct.adonis$aov.tab # Irrigation is somehwat significant (p = 0.006) but Depth is not nor is their interaction, for October Jose samples.
+
+
+
+## CONCLUSION => the July timepoint has the most pronounced / only significant Irrigation:Depth effect
+## (when separating out soil samples by individual timepoints).
+
+```
+
+## 2.2) Figure 2 - Ordination plots.
+
+```{r 2.2-Figure2-ordination-plots}
+
+# Make a list of themes for plots.
+nl <- list(theme(plot.title = element_text(size = 24, hjust = 0.5, face = "bold"),
+                         axis.title = element_text(size = 20, face = "bold"),
+                         axis.text = element_text(size = 14),
+                         strip.text.x = element_text(size = 14),
+                         legend.title = element_text(size = 16),
+                         legend.text = element_text(size = 12),
+                         legend.position = "none"))
+
+###########################################
+# Plot 2a) Full plot by irrigation*depth. #
+###########################################
+
+# bray.16s.2 <- ordinate(rar.16s, method = "PCoA", distance = "bray") # <- Regenerate that if necessary
+
+bray.full.1 <- plot_ordination(rar.16s, bray.16s.2, color = "SampleType_Irrigation",
+                               shape = "Depth", title = "All SampleTypes\nIrrigation by Depth") +
+  gg.options + scale_color_manual(values = st.ir_palette) +
+  theme(legend.title = element_text(size = 16), legend.text = element_text(size = 14)) +
+  theme(plot.title = element_text(size = 24, face = "bold")) 
+
+################################################
+# Plot 2b) Bulk soil only by irrigation*depth. #
+################################################
+
+# bray.16s.2.soil <- ordinate(subset_samples(rar.16s, SampleType == "BulkSoil"), method = "PCoA", distance = "bray") 
+  # ^ Regenerate that if necessary
+
+bray.full.3.soil <- plot_ordination(subset_samples(rar.16s, SampleType == "BulkSoil"),
+                                    bray.16s.2.soil, color = "SampleType_Irrigation",
+                                    shape = "Depth", title = "Bulk Soil\nIrrigation by Depth") +
+  gg.options + scale_color_manual(values = st.ir_palette[c(1:5)], drop = TRUE, na.translate = FALSE)
+
+###################################################
+# Plot 2c) Rhizospheres only by irrigation*depth. #
+###################################################
+
+# bray.16s.2.rhizo <- ordinate(subset_samples(rar.16s, SampleType == "Rhizosphere"), method = "PCoA", distance = "bray")
+  # ^ Regenerate that if necessary.
+
+bray.full.5.rhizo <- plot_ordination(subset_samples(rar.16s, SampleType == "Rhizosphere"),
+                                     bray.16s.2.rhizo, color = "SampleType_Irrigation", shape = "Depth",
+                                     title = "Rhizosphere\nIrrigation by Depth") +
+  gg.options + scale_color_manual(values = st.ir_palette[c(6:9)], drop = TRUE, na.translate = FALSE)
+
+################################
+# Plot 2d) Full plot by depth. #
+################################
+
+bray.full.18 <- plot_ordination(rar.16s, bray.16s.2, color = "Depth", shape = "Depth", title = "All SampleTypes\nDepth Only") +
+  gg.options + scale_color_manual(values = viridis(3)) +
+  theme(legend.title = element_text(size = 16), legend.text = element_text(size = 14)) +
+  theme(plot.title = element_text(size = 24, face = "bold"))
+
+#####################################
+# Plot 2e) Bulk soil only by depth. #
+#####################################
+
+bray.full.20.soil <- plot_ordination(subset_samples(rar.16s, SampleType == "BulkSoil"),
+                                     bray.16s.2.soil, color = "Depth", shape = "Depth",
+                                     title = "Bulk Soil\nDepth Only") +
+  gg.options + scale_color_manual(values = viridis(3), drop = TRUE, na.translate = FALSE)
+
+########################################
+# Plot 2f) Rhizospheres only by depth. #
+########################################
+
+bray.full.22.rhizo <- plot_ordination(subset_samples(rar.16s, SampleType == "Rhizosphere"), bray.16s.2.rhizo, color = "Depth", shape = "Depth", title = "Rhizosphere\nDepth Only") +
+  gg.options + scale_color_manual(values = viridis(3), drop = TRUE, na.translate = FALSE)
+
+bray_foroutline <- plot_grid(bray.full.1 + nl + theme(legend.position = "right"),
+                             plot_grid(bray.full.3.soil + nl,
+                                       bray.full.5.rhizo + nl,
+                                       labels = c("B)", "C)"),
+                                       label_size = 20),
+                             bray.full.18 + nl + theme(legend.position = "right"),
+                             plot_grid(bray.full.20.soil + nl,
+                                       bray.full.22.rhizo + nl,
+                                       labels = c("E)", "F)"),
+                                       label_size = 20),
+                             labels = c("A)", "", "D)", ""), label_size = 20, ncol = 2) %>%
+  ggsave("../submission_figures/Figure2.jpg", plot = .,
+            width = 18, height = 11, scale = 1.1, dpi = 400)
+
+```
+
+## 2.3) Effect Size of Irrigation.
+
+# 2.3.1) Generate a function to get the effect sizes.
+
+```{r 2.3.1-permanova-function}
+
+permanova.tables <- function(rar.object, dist.object, date.subset = NA,
+                             sampletype.subset = NA, depth.subset = NA,
+                             irrigation.subset = NA, justreport = FALSE){
+
+  # Generate a metadata table from the phyloseq object. We'll need this for the anova function.
+  metadata.object <- data.frame(sample_data(rar.object))
+  
+  # Initialize the variables we'll be using inside the function, which will help to generate the formula..
+  varlist <- c("Date", "Irrigation", "Depth", "Cultivar", "SampleType")
+  printdate <- "AllDates"
+  printsampletype <- "AllSampleTypes"
+  printdepth <- "AllDepths"
+  printirrigation <- "AllIrrigationTreatments"
+  
+  # If we're only considering one date, we can remove 'Date' as a factor of interest.
+  if(!is.na(date.subset)){
+    # df <- subset(df, Date == date.subset) # Can't subset phyloseq object inside a function.
+    varlist <- varlist[varlist != "Date"]
+    printdate <- date.subset
+  }
+  
+  # Similar for SampleType.
+  if(!is.na(sampletype.subset)){
+    # df <- subset(df, SampleType == sampletype.subset) # Still can't subset a phyloseq object inside a function, dummy.
+    varlist <- varlist[varlist != "SampleType"]
+    printsampletype <- sampletype.subset
+  }
+  
+  # Similar for Depth
+  if(!is.na(depth.subset)){
+    # df <- subset(df, SampleType == sampletype.subset) # Still can't subset a phyloseq object inside a function, dummy.
+    varlist <- varlist[varlist != "Depth"]
+    printdepth <- depth.subset
+  }
+  
+  # Similar for Irrigation.
+  if(!is.na(irrigation.subset)){
+    # df <- subset(df, SampleType == sampletype.subset) # Still can't subset a phyloseq object inside a function, dummy.
+    varlist <- varlist[varlist != "Irrigation"]
+    printirrigation <- irrigation.subset
+  }
+
+  # Note that April is missing rhizosphere samples, so we have to make a subset for that as well
+  if(!is.na(date.subset) & date.subset == "04292020"){
+    varlist <- varlist[varlist != "SampleType"]
+    printsampletype <- "BulkSoil"
+  }
+  
+  # Note that April is missing rhizosphere samples, so we have to make a subset for that as well
+  if(!is.na(irrigation.subset) & irrigation.subset == "T5"){
+    varlist <- varlist[varlist != "Cultivar"]
+    # printsampletype <- "BulkSoil"
+  }
+  
+  var <- paste(varlist, collapse = " + ")
+  
+  df.return <- data.frame(Date = character(), Variable = character(), Metric = character(), SampleType = character(), Depth = character(), Irrigation = character(), Sum.Sq = numeric(), p.value = numeric())
+  
+  # Take the metadata object, the unifrac object, and use these to calculate a PERMANOVA with adonis. 
+  # Note: this took some time to figure out - in this formula, you can't use your variable
+  # (because you're creating a string), so instead make a string with the NAME of your distance object
+  # (here, the local variable is just referred to as 'dist.object').
+  f <- as.formula(paste("dist.object", "~", var, sep = " "))
+  print(f)
+  permanova.object <- adonis2(f, data = metadata.object)
+  
+  df.perm <- permanova.object$aov.tab %>% data.frame()
+  
+  if(justreport){
+    print(df.perm)
+    return()
+  }
+  
+  # If we don't want to just report the data, but instead bind things together into one large dataframe,
+  # we can move on below.
+  
+  # Modify this dataframe to include all the variables by which we may want to facet data when graphing.
+  df.perm1 <- df.perm %>% mutate(p.value = Pr..F., Pr..F. = NULL, PctVar = round(R2, 3),
+                                 R2 = NULL, Variable = rownames(.), Date = printdate, SampleType = printsampletype,
+                                 Depth = printdepth, Irrigation = printirrigation) %>%
+    subset(., !Variable %in% c("Residuals", "Total")) %>% select(Date, Variable, SampleType, Depth, Irrigation, PctVar, p.value)
+  
+  rownames(df.perm1) <- paste(df.perm1$Date, df.perm1$SampleType, df.perm1$Depth, df.perm1$Irrigation, df.perm1$Variable, sep = "_")
+  
+  # Add in designations for significance.
+  df.perm1 <- df.perm1 %>% mutate(significance = case_when(p.value <= 0.001 ~ "***",
+                                                           (p.value <= 0.01 & p.value > 0.001) ~ "**",
+                                                           (p.value <= 0.05 & p.value > 0.01) ~ "*",
+                                                           p.value > 0.05 ~ "Not Significant"))
+  
+  # Add in factor levels.
+  df.perm1$Date <- factor(df.perm1$Date, levels = c("AllDates", "04292020", "07072020", "10152020"))
+  df.perm1$significance <- factor(df.perm1$significance, levels = c("Not Significant", "*", "**", "***"))
+  df.perm1$Variable <- factor(df.perm1$Variable, levels = c("Date", "Irrigation", "Depth", "Cultivar", "SampleType"))
+  df.perm1$SampleType <- factor(df.perm1$SampleType, levels = c("AllSampleTypes", "BulkSoil", "Rhizosphere"))
+  df.perm1$Depth <- factor(df.perm1$Depth, levels = c("AllDepths", "0-5cm", "5-15cm", "15-25cm"))
+  df.perm1$Irrigation <- factor(df.perm1$Irrigation, levels = c("AllIrrigationTreatments", "T1", "T2", "T3", "T4", "T5"))
+  
+  print(colnames(df.perm1))
+  
+  return(df.perm1)
+  
+}
+
+```
+
+# 2.3.2) Getting the effect sizes for 'Irrigation'.
+
+```{r 2.3.2-outline-draft-figure}
+
+rar.16s.april <- subset_samples(rar.16s, Date == "04292020")
+rar.16s.july <- subset_samples(rar.16s, Date == "07072020")
+rar.16s.oct <- subset_samples(rar.16s, Date == "10152020")
+
+rar.16s.april.soil <- phyloseq::subset_samples(rar.16s.april, SampleType == "BulkSoil")
+rar.16s.july.soil <- phyloseq::subset_samples(rar.16s.july, SampleType == "BulkSoil")
+rar.16s.oct.soil <- subset_samples(rar.16s.oct, SampleType == "BulkSoil")
+
+rar.16s.july.rhizo <- subset_samples(rar.16s.july, SampleType == "Rhizosphere")
+rar.16s.oct.rhizo <- subset_samples(rar.16s.oct, SampleType == "Rhizosphere")
+
+rar.16s.soil <- subset_samples(rar.16s, SampleType == "BulkSoil")
+rar.16s.rhizo <- subset_samples(rar.16s, SampleType == "Rhizosphere")
+
+bray.16s <- phyloseq::distance(rar.16s, method = "bray")
+bray.16s.april <- phyloseq::distance(rar.16s.april, method = "bray")
+bray.16s.april.soil <- phyloseq::distance(rar.16s.april.soil, method = "bray")
+
+bray.16s.july <- phyloseq::distance(rar.16s.july, method = "bray")
+bray.16s.july.soil <- phyloseq::distance(rar.16s.july.soil, method = "bray")
+bray.16s.july.rhizo <- phyloseq::distance(rar.16s.july.rhizo, method = "bray")
+
+bray.16s.oct <- phyloseq::distance(rar.16s.oct, method = "bray")
+bray.16s.oct.soil <- phyloseq::distance(rar.16s.oct.soil, method = "bray")
+bray.16s.oct.rhizo <- phyloseq::distance(rar.16s.oct.rhizo, method = "bray")
+
+bray.16s.0_5cm <- phyloseq::distance(subset_samples(rar.16s, Depth == "0-5cm"), method = "bray")
+bray.16s.0_5cm.april <- phyloseq::distance(subset_samples(rar.16s.april, Depth == "0-5cm"), method = "bray")
+bray.16s.0_5cm.july <- phyloseq::distance(subset_samples(rar.16s.july, Depth == "0-5cm"), method = "bray")
+bray.16s.0_5cm.oct <- phyloseq::distance(subset_samples(rar.16s.oct, Depth == "0-5cm"), method = "bray")
+
+bray.16s.5_15cm <- phyloseq::distance(subset_samples(rar.16s, Depth == "5-15cm"), method = "bray")
+bray.16s.5_15cm.april <- phyloseq::distance(subset_samples(rar.16s.april, Depth == "5-15cm"), method = "bray")
+bray.16s.5_15cm.july <- phyloseq::distance(subset_samples(rar.16s.july, Depth == "5-15cm"), method = "bray")
+bray.16s.5_15cm.oct <- phyloseq::distance(subset_samples(rar.16s.oct, Depth == "5-15cm"), method = "bray")
+
+bray.16s.15_25cm <- phyloseq::distance(subset_samples(rar.16s, Depth == "15-25cm"), method = "bray")
+bray.16s.15_25cm.april <- phyloseq::distance(subset_samples(rar.16s.april, Depth == "15-25cm"), method = "bray")
+bray.16s.15_25cm.july <- phyloseq::distance(subset_samples(rar.16s.july, Depth == "15-25cm"), method = "bray")
+bray.16s.15_25cm.oct <- phyloseq::distance(subset_samples(rar.16s.oct, Depth == "15-25cm"), method = "bray")
+
+bray.16s.0_5cm.soil <- phyloseq::distance(subset_samples(rar.16s.soil, Depth == "0-5cm"), method = "bray")
+bray.16s.0_5cm.april.soil <- phyloseq::distance(subset_samples(rar.16s.april.soil, Depth == "0-5cm"), method = "bray")
+bray.16s.0_5cm.july.soil <- phyloseq::distance(subset_samples(rar.16s.july.soil, Depth == "0-5cm"), method = "bray")
+bray.16s.0_5cm.oct.soil <- phyloseq::distance(subset_samples(rar.16s.oct.soil, Depth == "0-5cm"), method = "bray")
+
+bray.16s.5_15cm.soil <- phyloseq::distance(subset_samples(rar.16s.soil, Depth == "5-15cm"), method = "bray")
+bray.16s.5_15cm.april.soil <- phyloseq::distance(subset_samples(rar.16s.april.soil, Depth == "5-15cm"), method = "bray")
+bray.16s.5_15cm.july.soil <- phyloseq::distance(subset_samples(rar.16s.july.soil, Depth == "5-15cm"), method = "bray")
+bray.16s.5_15cm.oct.soil <- phyloseq::distance(subset_samples(rar.16s.oct.soil, Depth == "5-15cm"), method = "bray")
+
+bray.16s.15_25cm.soil <- phyloseq::distance(subset_samples(rar.16s.soil, Depth == "15-25cm"), method = "bray")
+bray.16s.15_25cm.april.soil <- phyloseq::distance(subset_samples(rar.16s.april.soil, Depth == "15-25cm"), method = "bray")
+bray.16s.15_25cm.july.soil <- phyloseq::distance(subset_samples(rar.16s.july.soil, Depth == "15-25cm"), method = "bray")
+bray.16s.15_25cm.oct.soil <- phyloseq::distance(subset_samples(rar.16s.oct.soil, Depth == "15-25cm"), method = "bray")
+
+bray.16s.0_5cm.rhizo <- phyloseq::distance(subset_samples(rar.16s.rhizo, Depth == "0-5cm"), method = "bray")
+# bray.16s.0_5cm.april.rhizo <- phyloseq::distance(subset_samples(rar.16s.april.rhizo, Depth == "0-5cm"), method = "bray")
+bray.16s.0_5cm.july.rhizo <- phyloseq::distance(subset_samples(rar.16s.july.rhizo, Depth == "0-5cm"), method = "bray")
+bray.16s.0_5cm.oct.rhizo <- phyloseq::distance(subset_samples(rar.16s.oct.rhizo, Depth == "0-5cm"), method = "bray")
+
+bray.16s.5_15cm.rhizo <- phyloseq::distance(subset_samples(rar.16s.rhizo, Depth == "5-15cm"), method = "bray")
+# bray.16s.5_15cm.april.rhizo <- phyloseq::distance(subset_samples(rar.16s.april.rhizo, Depth == "5-15cm"), method = "bray")
+bray.16s.5_15cm.july.rhizo <- phyloseq::distance(subset_samples(rar.16s.july.rhizo, Depth == "5-15cm"), method = "bray")
+bray.16s.5_15cm.oct.rhizo <- phyloseq::distance(subset_samples(rar.16s.oct.rhizo, Depth == "5-15cm"), method = "bray")
+
+bray.16s.15_25cm.rhizo <- phyloseq::distance(subset_samples(rar.16s.rhizo, Depth == "15-25cm"), method = "bray")
+# bray.16s.15_25cm.april.rhizo <- phyloseq::distance(subset_samples(rar.16s.april.rhizo, Depth == "15-25cm"), method = "bray")
+bray.16s.15_25cm.july.rhizo <- phyloseq::distance(subset_samples(rar.16s.july.rhizo, Depth == "15-25cm"), method = "bray")
+bray.16s.15_25cm.oct.rhizo <- phyloseq::distance(subset_samples(rar.16s.oct.rhizo, Depth == "15-25cm"), method = "bray")
+
+
+
+permtables.depth.bray_control <- rbind(permanova.tables(rar.object = rar.16s,
+                                                        dist.object = bray.16s),
+                                       permanova.tables(rar.object = rar.16s.soil,
+                                                        dist.object = bray.16s.soil,
+                                                        sampletype.subset = "BulkSoil"),
+                                       permanova.tables(rar.object = rar.16s.rhizo,
+                                                        dist.object = bray.16s.rhizo,
+                                                        sampletype.subset = "Rhizosphere"), 
+                                        permanova.tables(rar.object = rar.16s.april.soil,
+                                                         dist.object = bray.16s.april.soil,
+                                                         sampletype.subset = "BulkSoil",
+                                                         date.subset = "04292020"),
+                                        permanova.tables(rar.object = rar.16s.july.soil,
+                                                         dist.object = bray.16s.july.soil,
+                                                         sampletype.subset = "BulkSoil",
+                                                         date.subset = "07072020"),
+                                        permanova.tables(rar.object = rar.16s.oct.soil,
+                                                         dist.object = bray.16s.oct.soil,
+                                                         sampletype.subset = "BulkSoil",
+                                                         date.subset = "10152020"),
+                                       permanova.tables(rar.object = rar.16s.july.rhizo,
+                                                        dist.object = bray.16s.july.rhizo,
+                                                        sampletype.subset = "Rhizosphere",
+                                                        date.subset = "07072020"),
+                                        permanova.tables(rar.object = rar.16s.oct.rhizo,
+                                                         dist.object = bray.16s.oct.rhizo,
+                                                         sampletype.subset = "Rhizosphere",
+                                                         date.subset = "10152020"),
+                                   permanova.tables(rar.object = subset_samples(rar.16s, Depth == "0-5cm"),
+                                                    dist.object = bray.16s.0_5cm,
+                                                    depth.subset = "0-5cm"),
+                                   permanova.tables(rar.object = subset_samples(rar.16s.april, Depth == "0-5cm"),
+                                                    dist.object = bray.16s.0_5cm.april,
+                                                    depth.subset = "0-5cm",
+                                                    date.subset = "04292020"),
+                                   permanova.tables(rar.object = subset_samples(rar.16s.july, Depth == "0-5cm"),
+                                                    dist.object = bray.16s.0_5cm.july,
+                                                    depth.subset = "0-5cm",
+                                                    date.subset = "07072020"),
+                                   permanova.tables(rar.object = subset_samples(rar.16s.oct, Depth == "0-5cm"),
+                                                    dist.object = bray.16s.0_5cm.oct,
+                                                    depth.subset = "0-5cm",
+                                                    date.subset = "10152020"),
+                                   permanova.tables(rar.object = subset_samples(rar.16s.soil, Depth == "0-5cm"),
+                                                    dist.object = bray.16s.0_5cm.soil,
+                                                    depth.subset = "0-5cm",
+                                                    sampletype.subset = "BulkSoil"),
+                                   permanova.tables(rar.object = subset_samples(rar.16s.april.soil, Depth == "0-5cm"),
+                                                    dist.object = bray.16s.0_5cm.april.soil,
+                                                    depth.subset = "0-5cm",
+                                                    date.subset = "04292020",
+                                                    sampletype.subset = "BulkSoil"),
+                                   permanova.tables(rar.object = subset_samples(rar.16s.july.soil, Depth == "0-5cm"),
+                                                    dist.object = bray.16s.0_5cm.july.soil,
+                                                    depth.subset = "0-5cm",
+                                                    date.subset = "07072020",
+                                                    sampletype.subset = "BulkSoil"),
+                                   permanova.tables(rar.object = subset_samples(rar.16s.oct.soil, Depth == "0-5cm"),
+                                                    dist.object = bray.16s.0_5cm.oct.soil,
+                                                    depth.subset = "0-5cm",
+                                                    date.subset = "10152020",
+                                                    sampletype.subset = "BulkSoil"),
+                                   permanova.tables(rar.object = subset_samples(rar.16s.rhizo, Depth == "0-5cm"),
+                                                    dist.object = bray.16s.0_5cm.rhizo,
+                                                    depth.subset = "0-5cm",
+                                                    sampletype.subset = "Rhizosphere"),
+                                   permanova.tables(rar.object = subset_samples(rar.16s.july.rhizo, Depth == "0-5cm"),
+                                                    dist.object = bray.16s.0_5cm.july.rhizo,
+                                                    depth.subset = "0-5cm",
+                                                    date.subset = "07072020",
+                                                    sampletype.subset = "Rhizosphere"),
+                                   permanova.tables(rar.object = subset_samples(rar.16s.oct.rhizo, Depth == "0-5cm"),
+                                                    dist.object = bray.16s.0_5cm.oct.rhizo,
+                                                    depth.subset = "0-5cm",
+                                                    date.subset = "10152020",
+                                                    sampletype.subset = "Rhizosphere"),
+                                   permanova.tables(rar.object = subset_samples(rar.16s, Depth == "5-15cm"),
+                                                    dist.object = bray.16s.5_15cm,
+                                                    depth.subset = "5-15cm"),
+                                   permanova.tables(rar.object = subset_samples(rar.16s.april, Depth == "5-15cm"),
+                                                    dist.object = bray.16s.5_15cm.april,
+                                                    depth.subset = "5-15cm",
+                                                    date.subset = "04292020"),
+                                   permanova.tables(rar.object = subset_samples(rar.16s.july, Depth == "5-15cm"),
+                                                    dist.object = bray.16s.5_15cm.july,
+                                                    depth.subset = "5-15cm",
+                                                    date.subset = "07072020"),
+                                   permanova.tables(rar.object = subset_samples(rar.16s.oct, Depth == "5-15cm"), 
+                                                    dist.object = bray.16s.5_15cm.oct,
+                                                    depth.subset = "5-15cm",
+                                                    date.subset = "10152020"),
+                                   permanova.tables(rar.object = subset_samples(rar.16s.soil, Depth == "5-15cm"),
+                                                    dist.object = bray.16s.5_15cm.soil,
+                                                    depth.subset = "5-15cm",
+                                                    sampletype.subset = "BulkSoil"),
+                                   permanova.tables(rar.object = subset_samples(rar.16s.april.soil, Depth == "5-15cm"),
+                                                    dist.object = bray.16s.5_15cm.april.soil,
+                                                    depth.subset = "5-15cm",
+                                                    date.subset = "04292020",
+                                                    sampletype.subset = "BulkSoil"),
+                                   permanova.tables(rar.object = subset_samples(rar.16s.july.soil, Depth == "5-15cm"),
+                                                    dist.object = bray.16s.5_15cm.july.soil,
+                                                    depth.subset = "5-15cm",
+                                                    date.subset = "07072020",
+                                                    sampletype.subset = "BulkSoil"),
+                                   permanova.tables(rar.object = subset_samples(rar.16s.oct.soil, Depth == "5-15cm"),
+                                                    dist.object = bray.16s.5_15cm.oct.soil,
+                                                    depth.subset = "5-15cm",
+                                                    date.subset = "10152020",
+                                                    sampletype.subset = "BulkSoil"),
+                                   permanova.tables(rar.object = subset_samples(rar.16s.rhizo, Depth == "5-15cm"),
+                                                    dist.object = bray.16s.5_15cm.rhizo,
+                                                    depth.subset = "5-15cm",
+                                                    sampletype.subset = "Rhizosphere"),
+                                   permanova.tables(rar.object = subset_samples(rar.16s.july.rhizo, Depth == "5-15cm"),
+                                                    dist.object = bray.16s.5_15cm.july.rhizo,
+                                                    depth.subset = "5-15cm",
+                                                    date.subset = "07072020",
+                                                    sampletype.subset = "Rhizosphere"),
+                                   permanova.tables(rar.object = subset_samples(rar.16s.oct.rhizo, Depth == "5-15cm"),
+                                                    dist.object = bray.16s.5_15cm.oct.rhizo,
+                                                    depth.subset = "5-15cm",
+                                                    date.subset = "10152020",
+                                                    sampletype.subset = "Rhizosphere"),
+                                   permanova.tables(rar.object = subset_samples(rar.16s, Depth == "15-25cm"),
+                                                    dist.object = bray.16s.15_25cm,
+                                                    depth.subset = "15-25cm"),
+                                   permanova.tables(rar.object = subset_samples(rar.16s.april, Depth == "15-25cm"),
+                                                    dist.object = bray.16s.15_25cm.april,
+                                                    depth.subset = "15-25cm",
+                                                    date.subset = "04292020"),
+                                   permanova.tables(rar.object = subset_samples(rar.16s.july, Depth == "15-25cm"),
+                                                    dist.object = bray.16s.15_25cm.july,
+                                                    depth.subset = "15-25cm",
+                                                    date.subset = "07072020"),
+                                   permanova.tables(rar.object = subset_samples(rar.16s.oct, Depth == "15-25cm"),
+                                                    dist.object = bray.16s.15_25cm.oct,
+                                                    depth.subset = "15-25cm",
+                                                    date.subset = "10152020"),
+                                   permanova.tables(rar.object = subset_samples(rar.16s.soil, Depth == "15-25cm"),
+                                                    dist.object = bray.16s.15_25cm.soil,
+                                                    depth.subset = "15-25cm",
+                                                    sampletype.subset = "BulkSoil"),
+                                   permanova.tables(rar.object = subset_samples(rar.16s.april.soil, Depth == "15-25cm"),
+                                                    dist.object = bray.16s.15_25cm.april.soil,
+                                                    depth.subset = "15-25cm",
+                                                    date.subset = "04292020",
+                                                    sampletype.subset = "BulkSoil"),
+                                   permanova.tables(rar.object = subset_samples(rar.16s.july.soil, Depth == "15-25cm"),
+                                                    dist.object = bray.16s.15_25cm.july.soil,
+                                                    depth.subset = "15-25cm",
+                                                    date.subset = "07072020",
+                                                    sampletype.subset = "BulkSoil"),
+                                   permanova.tables(rar.object = subset_samples(rar.16s.oct.soil, Depth == "15-25cm"),
+                                                    dist.object = bray.16s.15_25cm.oct.soil,
+                                                    depth.subset = "15-25cm",
+                                                    date.subset = "10152020", 
+                                                    sampletype.subset = "BulkSoil"),
+                                   permanova.tables(rar.object = subset_samples(rar.16s.rhizo, Depth == "15-25cm"),
+                                                    dist.object = bray.16s.15_25cm.rhizo,
+                                                    depth.subset = "15-25cm",
+                                                    sampletype.subset = "Rhizosphere"),
+                                   permanova.tables(rar.object = subset_samples(rar.16s.july.rhizo, Depth == "15-25cm"),
+                                                    dist.object = bray.16s.15_25cm.july.rhizo,
+                                                    depth.subset = "15-25cm",
+                                                    date.subset = "07072020",
+                                                    sampletype.subset = "Rhizosphere"),
+                                   permanova.tables(rar.object = subset_samples(rar.16s.oct.rhizo, Depth == "15-25cm"),
+                                                    dist.object = bray.16s.15_25cm.oct.rhizo,
+                                                    depth.subset = "15-25cm",
+                                                    date.subset = "10152020",
+                                                    sampletype.subset = "Rhizosphere"))
+
+
+permtables.depth.bray_control$Controls <- "Controls"
+permtables.depth.bray_control$Distance <- "BrayCurtis"
+
+# Add in a significance column that species the degree to which the p-values are significant.
+permtables.depth.bray_control <- permtables.depth.bray_control %>% mutate(significance = case_when(p.value <= 0.001 ~ "***",
+                                                                           (p.value <= 0.01 & p.value > 0.001) ~ "**",
+                                                                           (p.value <= 0.05 & p.value > 0.01) ~ "*",
+                                                                           p.value > 0.05 ~ "Not Significant"))
+
+# Add in factor values.
+permtables.depth.bray_control$Date <- factor(permtables.depth.bray_control$Date,
+                                             levels = c("AllDates", "04292020", "07072020", "10152020"))
+
+permtables.depth.bray_control$Depth <- factor(permtables.depth.bray_control$Depth,
+                                              levels = c("AllDepths", "0-5cm", "5-15cm", "15-25cm"))
+
+permtables.depth.bray_control$significance <- factor(permtables.depth.bray_control$significance,
+                                                     levels = c("Not Significant", "*", "**", "***"))
+
+permtables.depth.bray_control$SampleType <- factor(permtables.depth.bray_control$SampleType,
+                                                   levels = c("AllSampleTypes", "BulkSoil", "Rhizosphere"))
+
+
+# perm.depthdistances.irrigation_barplot <- ggplot(data=permtables.depth.bray_control[permtables.depth.bray_control$Variable
+#                                                                                     == "Irrigation" &
+#                                                                                       permtables.depth.bray_control$SampleType
+#                                                                                     != "AllSampleTypes" &
+#                                                                                       permtables.depth.bray_control$Date
+#                                                                                     != "AllDates",],
+#                                          aes(x=Date,y=PctVar, fill=significance)) +
+#   geom_bar(stat="identity", position = "dodge", colour = "black") +
+#   facet_wrap( ~ SampleType + Depth, scales = "free_x", ncol = 4) +
+#   scale_fill_manual(values = c("white", brewer.pal(4, "Greys")[c(2:4)]), drop = FALSE) +
+#   theme(axis.text.x=element_text(size = 16, color = "black", angle = 60, hjust = 1),
+#         axis.text.y=element_text(size=16,color="black"),
+#         axis.title.y=element_text(size=16,face="bold"),
+#         axis.title.x = element_blank(), strip.background = element_rect(color = "black", fill = "grey90"),
+#         text=element_text(size=24), plot.title = element_text(size = 24, face = "bold", hjust = 0.5)) +
+#   xlab("Date") + ylab("% Variance Explained") + theme(panel.spacing = unit(1, "lines")) +
+#   theme(legend.text = element_text(size = 16), legend.position = "bottom") + ggtitle("PERMANOVA Effect Size of Irrigation\nby Depth and SampleType\n")
+# 
+# save_plot("../figures/betadiversity/PERMANOVAEffectSizebyDepth_Irrigation.pdf",
+#           plot = perm.depthdistances.irrigation_barplot, base_width = 6, base_height = 10, scale = 1.5)
+
+
+```
+
+
+# 2.3.3) Combine the effect sizes of Irrigation for the beta-diversity values, with the effect sizes for the alpha-diversity metrics Shannon's diversity and richness.
+
+This is an alternative block of code you could use to generate Supplemental Figure 3.
+
+```{r 2.3.3-conjoining-effect-size-with-alpha-diversity}
+# 
+# depthsig.collective3 <- depthsig.collective %>% mutate(PctVar = Sum.Sq) %>% select(., Date, Variable, Metric, SampleType, Depth, PctVar, p.value, significance)
+# 
+# permtables.depth.bray_control2 <- permtables.depth.bray_control %>% mutate(Metric = Distance) %>% select(., Date, Variable, Metric, SampleType, Depth, PctVar, p.value, significance)
+# 
+# effectsize.collective <- rbind(depthsig.collective3, permtables.depth.bray_control2)
+# 
+# # Making a specific one for the outline draft. 
+# effectsizes.irrigation_barplot <- ggplot(data=effectsize.collective[effectsize.collective$Variable == "Irrigation" & 
+#                                                                               effectsize.collective$SampleType != "AllSampleTypes" &
+#                                                                               effectsize.collective$Date != "AllDates" &
+#                                                                       effectsize.collective$Metric != "Simpson",],
+#                                          aes(x=Date,y=PctVar, fill=significance)) +
+#   geom_bar(stat="identity", position = "dodge", colour = "black") +
+#   facet_grid(Metric ~ SampleType + Depth, scales = "free_x") +
+#   scale_fill_manual(values = c("white", brewer.pal(4, "Greys")[c(2:4)]), drop = FALSE) +
+#   theme(axis.text.x=element_text(size = 16, color = "black", angle = 60, hjust = 1),
+#         axis.text.y=element_text(size=16,color="black"),
+#         axis.title.y=element_text(size=16,face="bold"),
+#         axis.title.x = element_blank(), strip.background = element_rect(color = "black", fill = "grey90"),
+#         text=element_text(size=24), plot.title = element_text(size = 36, face = "bold", hjust = 0.5)) +
+#   xlab("Date") + ylab("% Variance Explained") + theme(panel.spacing = unit(1, "lines")) +
+#   theme(legend.text = element_text(size = 16), legend.position = "bottom") + ggtitle("Effect Size of Irrigation by Depth and SampleType\n")
+# 
+# save_plot("../figures/betadiversity/CombinedEffectSizes_AlphaandBetaDiversity.pdf",
+#           plot = effectsizes.irrigation_barplot, base_width = 10, base_height = 10, scale = 1.5)
+```
+
+
+
+
+### 3) Relative Abundance Plots.
+
+
+
+```{r 3.0-function-for-generating-melted-table-of-abundance-data}
+
+##############################################################
+### Function for generating tables for count data by taxa. ###
+##############################################################
+
+# We can quickly customize our relative abundance graphs to any taxonomic level or number of top taxa
+# that we want using the below function, which generates a melt table with the top n classes' abundance
+# as columns and samples as rows. Also metadata is included, for simpler faceting in plots.
+
+relabundance_melttable <- function(phy, n = 10, rank = "Phylum"){
+  
+  # Determine what the top n phyla are. Doing 'n+1' in order to capture the unknown ('?') phylum.
+  top_taxa <- as.list(sort(tapply(taxa_sums(phy), tax_table(phy)[,rank], sum), TRUE)[1:(n+1)]) %>% names()
+ 
+  # If one of the top_taxa is unknown, we want to remove it from this list.
+  top_taxa <- top_taxa[top_taxa != "?"]
+  
+  # If not, we want to remove the extra element so we only have n elements in this list.
+  if(length(top_taxa) > n){
+    top_taxa <- top_taxa[1:(length(top_taxa) - 1)]
+  }
+  print(top_taxa)
+  
+  # Rename the taxa that aren't in the top n to just be "Other".
+  tax_table(phy)[!tax_table(phy)[,rank] %in% top_taxa,rank] <- "Other"
+
+  tax_table(phy)[,rank] <- factor(tax_table(phy)[,rank], levels = c(top_taxa, "Other")) %>% as.character()
+
+  # In order for us to glom successfully, we need to remove the columns prior to the taxrank we're using. E.g. if using 'Class',
+  # we need to remove 'Domain' and 'Phylum'.
+  tax_table(phy) <- tax_table(phy)[,which(colnames(tax_table(phy)) == rank):length(colnames(tax_table(phy)))]
+
+  phy.glom <- tax_glom(phy, taxrank = rank)
+  taxa_names(phy.glom) <- tax_table(phy.glom)[,rank]
+  
+  if(taxa_are_rows(phy.glom) == TRUE){
+    glom.table <- cbind(data.frame(sample_data(phy.glom)), t(data.frame(otu_table(phy.glom))))
+  }
+  
+  if(taxa_are_rows(phy.glom) == FALSE){
+    glom.table <- cbind(data.frame(sample_data(phy.glom)), data.frame(otu_table(phy.glom)))
+  }
+  
+  if("Replicate" %in% colnames(glom.table)){
+    glom.table$Replicate <- as.character(glom.table$Replicate)
+  }
+  
+  glom.melt <- reshape2::melt(data = glom.table, value.name = "Abundance", variable.name = rank)
+
+  # Remove any NAs.
+  glom.melt <- glom.melt[!is.na(glom.melt[,rank]),]
+
+  # Relevel the taxrank so 'Other' is last.
+  glom.melt[,rank] <- factor(glom.melt[,rank], levels = c(sort(top_taxa), "Other"))
+  
+  # Having a minor issue with Actinobacteria as a class becoming an NA down the line.
+
+  return(glom.melt)
+}
+
+```
+
+
+## 3.1) Relative abundance plots by depth or irrigation at the class level.
+
+# 3.1.1) Figure 3ab.
+
+Class-level relative abundance plots by irrigation (3A) or by depth (3B).
+
+```{r 3.1.1-Figure3ab-class-relative-abundance-plots}
+
+##############################################################################
+### Use the above function to generate melt tables for the top 15 classes. ###
+##############################################################################
+
+tax_table(rar.16s)[,"Class"] <- gsub("_\\(class\\)", "", tax_table(rar.16s)[,"Class"])
+tax_table(rar.16s)[,"Class"] <- gsub("Blastocatellia.*", "Blastocatellia", tax_table(rar.16s)[,"Class"])
+  
+class.melt <- relabundance_melttable(rar.16s, n = 15, rank = "Class")
+
+# Change the dates in the class.melt object.
+levels(class.melt$Date) <- c("April", "July", "October")
+
+class.melt$Unique <- with(class.melt, interaction(class.melt$Date, class.melt$Irrigation,
+                                                  class.melt$Depth, class.melt$Cultivar, class.melt$SampleType))
+
+# Make palettes for these two graphs. Should include 'n' colors + grey for 'Other'.
+class.palette <- c(viridis(7), rev(magma(8)), "gray34")
+
+  #############################################
+  ### Class-Level Relative Abundance Plots. ###
+  #############################################
+
+############################################################################################
+## Make a class plot segregated by date and sample type, where the x-axis is irrigation. ##
+############################################################################################
+
+class_plot.irrigation <- ggplot(data=class.melt,aes(x=Irrigation,y=Abundance,fill=Class)) +
+  geom_bar(stat="identity", position = "fill") +
+  facet_wrap(SampleType ~ Date, scales = "free_x", nrow = 2) + scale_fill_manual(values = class.palette, drop = FALSE) +
+  xlab("Irrigation") + ylab("Relative Abundance") + nl + theme(legend.position = "bottom") +
+  guides(fill = guide_legend(ncol = 3)) +
+  ggtitle("Class Relative Abundance by Irrigation")
+
+#######################################################################################
+## Make a class plot segregated by date and sample type, where the x-axis is depth. ##
+#######################################################################################
+
+class_plot.depth <- ggplot(data=class.melt,aes(x=Depth,y=Abundance,fill=Class)) +
+  geom_bar(stat="identity", position = "fill") +
+  facet_wrap(SampleType ~ Date, scales = "free_x", nrow = 2) +
+  xlab("Depth") + ylab("Relative Abundance") + scale_fill_manual(values = class.palette, drop = FALSE) +
+  theme(legend.position = "none", axis.text.x = element_text(angle = 45, vjust = 0.5)) +
+  ggtitle("Class Relative Abundance by Depth")
+
+# Join these two plots together as Figure 3ab.
+
+plot_grid(class_plot.irrigation, class_plot.depth + nl, labels = c("A)", "B)"),
+          label_size = 24, ncol = 1, rel_heights = c(1.05, 0.95)) %>%
+  ggsave("../submission_figures/Figure3ab.jpg", plot = .,
+         width = 7, height = 15, scale = 1.1, dpi = 400)
+
+```
+
+# 3.1.2) Figure 3cd.
+
+Here, we are generating line plots to show how relative abundances of classes vary by irrigation or by depth.
+
+```{r 3.1.2-Figure3cd-line-plots-for-class-relative-abundance}
+
+########################
+### Class dataframe. ###
+########################
+
+# Making a line plot with irrigation levels as the x-axis,
+# and individual lines for all sampletype * timepoint combinations.
+  # Note: the summarySE() function comes from the 'Rmisc' package.
+
+class.changes <- relabundance_melttable(rar.16s, n = 10, rank = "Class") %>% mutate(Abundance = Abundance / rardepth)
+levels(class.changes$Date) <- c("April", "July", "October")
+df.classchanges <- summarySE(class.changes, measurevar = "Abundance", groupvars = c("Class", "SampleType", "Irrigation", "Date"))
+df.classchanges$SampleType_Date <- paste(df.classchanges$SampleType, df.classchanges$Date, sep = "_") %>%
+  factor(., levels = c("BulkSoil_April", "BulkSoil_July", "BulkSoil_October",
+                       "Rhizosphere_July","Rhizosphere_October"))
+
+# This code below is modified from this source: http://www.cookbook-r.com/Graphs/Plotting_means_and_error_bars_(ggplot2)
+# We're using standard error of the mean as the basis for error bars.
+
+#################################################
+## Graphing all samples at once by irrigation. ##
+#################################################
+
+# Figure 3C - x-axis is irrigation.
+
+class.linechanges.full_plot <- ggplot(df.classchanges, aes(x=Irrigation, y=Abundance, colour=SampleType_Date)) + 
+  scale_colour_manual(values = c(brewer.pal(4, "Reds")[c(2:4)], brewer.pal(4, "Blues")[c(2,4)])) +
+  geom_errorbar(aes(ymin=Abundance-se, ymax=Abundance+se), width=.1) +
+  geom_smooth(aes(group = SampleType_Date, colour = SampleType_Date), size = 2.5) +
+  facet_wrap(Class ~ SampleType, scales = "free", nrow = 11) +
+  geom_point(position = position_dodge(0.1)) + classthemes +
+  theme(strip.text.x = element_text(size = 11, face = "bold"),
+        legend.position = "right",
+        strip.background = element_rect(color = "black", fill = "grey90")) +
+  ggtitle("Relative Abundance Shifts over Irrigation\nby Class")
+
+# Figure 3D - Having the x-axis be depth instead of irrigation.
+
+df.classchanges_bydepth <- summarySE(class.changes, measurevar = "Abundance", groupvars = c("Class", "SampleType", "Depth", "Date"))
+
+df.classchanges_bydepth$SampleType_Date <- paste(df.classchanges_bydepth$SampleType, df.classchanges_bydepth$Date, sep = "_") %>%
+  factor(., levels = c("BulkSoil_April", "BulkSoil_July","BulkSoil_October",
+                       "Rhizosphere_July", "Rhizosphere_October"))
+  
+class.linechanges.full_plot.depth <- ggplot(df.classchanges_bydepth,
+                                            aes(x=Depth, y=Abundance, colour=SampleType_Date)) + 
+  scale_colour_manual(values = c(brewer.pal(4, "Reds")[c(2:4)], brewer.pal(4, "Blues")[c(2,4)])) +
+  geom_errorbar(aes(ymin=Abundance-se, ymax=Abundance+se), width=.1) +
+  geom_smooth(aes(group = SampleType_Date, colour = SampleType_Date), size = 2.5) +
+  facet_wrap(Class ~ SampleType, scales = "free", nrow = 11) +
+  geom_point(position = position_dodge(0.1)) + classthemes + 
+  theme(strip.text.x = element_text(size = 11, face = "bold"), legend.position = "none",
+        strip.background = element_rect(color = "black", fill = "grey90")) +
+  ggtitle("Relative Abundance Shifts over Depth\nby Class")
+
+# Join these two together and save the plot image.
+class_linegraphs <- plot_grid(class.linechanges.full_plot + nl, class.linechanges.full_plot.depth + nl,
+                              labels = c("C)", "D)"), label_size = 24, ncol = 2, rel_widths = c(1.1, 0.9)) %>%
+  ggsave("../submission_figures/Figure3cd.jpg", plot = ., width = 16, height = 24, scale = 1.1, dpi = 400)
+
+
+```
+
+# 3.1.3) Supplemental Figure 5.
+
+Class relative abundance by irrigation and depth.
+
+```{r 3.1.3-SupplementalFigure5-class-relative-abundance-by-irrigation-and-depth}
+
+#################################################################################################
+## Make an overall class-level plot for irrigation but segregate it by depth and sample type. ##
+#################################################################################################
+
+class.melt$SampleType_Date <- paste(class.melt$SampleType, class.melt$Date, sep = "_") %>%
+  factor(., levels = c("BulkSoil_April", "BulkSoil_July", "BulkSoil_October",
+                       "Rhizosphere_July", "Rhizosphere_October"))
+
+class_plot.irrigation_by_depth <- ggplot(data=class.melt,aes(x=Irrigation,y=Abundance,fill=Class)) +
+  geom_bar(stat="identity", position = "fill") +
+  theme(strip.background = element_rect(colour="black", fill="gray")) +
+  facet_grid(Depth ~ SampleType_Date, scales = "free_x") +
+  theme(strip.text = element_text(size = 16), axis.text = element_text(size = 24), axis.title = element_text(size = 24)) +
+  xlab("\nIrrigation") + # theme(legend.position = c(0.85, 0.25)) +
+  ggtitle("Class Relative Abundance by Irrigation and Depth\n") +
+  nl + theme(legend.position = "bottom") +scale_fill_manual(values = class.palette, drop = FALSE)
+
+ggsave("../submission_figures/SupplementalFigure5.jpg", plot = class_plot.irrigation_by_depth,
+          width = 10, height = 10, scale = 1.1, dpi = 400)
+
+```
+
+
+## 3.2) Relative abundance for cultivar (rhizosphere samples only) at the class level.
+
+# 3.2.1) Supplemental Figure 6.
+
+This includes both relative abundance plots (again at the class level) for rhizosphere communities, as well as 
+a DESeq plot showing differentially enriched taxa trends for Alkar vs. Jose.
+
+```{r 3.2.1-SupplementalFigure6-classlevel-relative-abundance-cultivar-effects}
+
+##################################################################################################################
+## Make a class-level plot that shows how cultivar affects the microbiome differently within the rhizospheres. ##
+##################################################################################################################
+
+rhizo.class.melt <- class.melt
+levels(rhizo.class.melt$Date) <- c("April", "July", "October")
+rhizo.class.melt$Date_Cultivar <- paste(rhizo.class.melt$Date, rhizo.class.melt$Cultivar, sep = "_") %>% factor(., levels = c("July_Alkar", "July_Jose", "October_Alkar", "October_Jose"))
+class.palette <- c(viridis(7), rev(magma(8)), "gray34")
+
+# Make an object with the plot themes we'll be using for the class relative abundance plots.
+classthemes <- list(scale_fill_manual(values = class.palette, drop = FALSE), ylab("Class-Level Relative Abundance\n"),
+                  theme(axis.text.x=element_text(size = 16, color = "black", hjust = 0.5), 
+                        axis.text.y=element_text(size=16,color="black"),
+                        axis.title.y=element_text(size=20,face="bold"),
+                        axis.title.x = element_text(size=20,face="bold"),
+                        plot.title = element_text(size = 24, face = "bold", hjust = 0.5),
+                        text=element_text(size=24), panel.spacing = unit(1, "lines"),
+                        legend.text = element_text(size = 16), legend.title = element_text(size = 20)))
+
+
+class_plot.rhizosphere.cultivar <- ggplot(data=rhizo.class.melt[rhizo.class.melt$SampleType == "Rhizosphere",],aes(x=Cultivar,y=Abundance,fill=Class)) +
+  geom_bar(stat="identity", position = "fill") + theme(legend.position = 'none') +
+  facet_grid( ~ Date, scales = "free_x", space = "free_x") + theme(legend.position = 'none') +
+  xlab("Cultivar") + classthemes + theme(axis.text.x = element_text(hjust = 1, angle = 45),
+                                         plot.title = element_text(size = 20, hjust = 0.5, face = "bold")) +
+  ggtitle("Relative Abundance\nby Cultivar")
+
+class_plot.rhizosphere.cultivar.byirrigation <- ggplot(data=rhizo.class.melt[rhizo.class.melt$SampleType == "Rhizosphere",],
+                                                       aes(x=Irrigation,y=Abundance,fill=Class)) +
+  geom_bar(stat="identity", position = "fill") +
+  facet_grid(Date ~ Cultivar, scales = "free_x", space = "free_x") +
+  theme(legend.position = "none") +
+  xlab("Irrigation") + classthemes +
+  theme(axis.text.x = element_text(size = 14), plot.title = element_text(size = 20, hjust = 0.5, face = "bold")) +
+  ggtitle("Relative Abundance\nby Cultivar and Irrigation") 
+
+class_plot.rhizosphere.cultivar.bydepth <- ggplot(data=rhizo.class.melt[rhizo.class.melt$SampleType == "Rhizosphere",],
+                                                  aes(x=Depth,y=Abundance,fill=Class)) +
+  geom_bar(stat="identity", position = "fill") +
+  facet_grid(Date ~ Cultivar, scales = "free_x", space = "free_x") +
+  theme(legend.position = "right") +
+  xlab("Depth") +
+  classthemes +
+  theme(axis.text.x = element_text(size = 14, angle = 45, vjust = 0.5),
+        plot.title = element_text(size = 20, hjust = 0.5, face = "bold")) +
+  ggtitle("Relative Abundance\nby Cultivar and Depth") 
+
+class_levels <- c("Acidimicrobiia", "Actinobacteria", "Alphaproteobacteria", "Bacilli", "Betaproteobacteria", "Blastocatellia",
+                  "Chloroflexi_Subdivision_10", "Deltaproteobacteria", "Gammaproteobacteria", "Gemmatimonadetes", "Nitrososphaeria",
+                  "Phycisphaerae", "Planctomycetacia", "Subgroup_6", "Thermoleophilia", "Other")
+
+class.palette <- c(viridis(7), rev(magma(8)), "gray34")
+
+#######################################
+### DESeq - Rhizosphere by Cultivar ###
+#######################################
+
+  # Is the cultivar effect stronger at July or October?
+sigtab.rhizo.bycultivar.july <- func.deseq(subset_samples(rar.16s, SampleType == "Rhizosphere" & Date == "07072020"),
+                                           factor = "Cultivar")
+    # No significant OTUs.
+
+sigtab.rhizo.bycultivar.oct <- func.deseq(subset_samples(rar.16s, SampleType == "Rhizosphere" & Date == "10152020"),
+                                          factor = "Cultivar")
+    # No significant OTUs.
+
+  # Is the cultivar effect stronger at T4 or T1 irrigation?
+sigtab.rhizo.bycultivar.t1 <- func.deseq(subset_samples(rar.16s, SampleType == "Rhizosphere" & Irrigation == "T1"),
+                                         factor = "Cultivar")
+    # No significant OTUs.
+
+sigtab.rhizo.bycultivar.t4 <- func.deseq(subset_samples(rar.16s, SampleType == "Rhizosphere" & Irrigation == "T4"),
+                                         factor = "Cultivar")
+    # 19 significant OTUs.
+
+sigtab.rhizo.bycultivar.july.t1 <- func.deseq(subset_samples(rar.16s,
+                                                             SampleType == "Rhizosphere" & Date == "07072020" & Irrigation == "T1"),
+                                              factor = "Cultivar")
+    # No significant OTUs.
+
+sigtab.rhizo.bycultivar.july.t4 <- func.deseq(subset_samples(rar.16s,
+                                                             SampleType == "Rhizosphere" & Date == "07072020" & Irrigation == "T4"),
+                                              factor = "Cultivar")
+    # No significant OTUs.
+
+sigtab.rhizo.bycultivar.oct.t1 <- func.deseq(subset_samples(rar.16s,
+                                                            SampleType == "Rhizosphere" & Date == "10152020" & Irrigation == "T1"),
+                                             factor = "Cultivar")
+    # 3 significant OTUs
+sigtab.rhizo.bycultivar.oct.t4 <- func.deseq(subset_samples(rar.16s,
+                                                            SampleType == "Rhizosphere" & Date == "10152020" & Irrigation == "T4"),
+                                             factor = "Cultivar")
+    # 2 significant OTUs.
+
+######################################
+### Irrigation trends by cultivar. ###
+######################################
+
+sigtab.alkar.byirrigation <- func.deseq(subset_samples(rar.16s,
+                                                       SampleType == "Rhizosphere" & Irrigation %in% c("T1", "T4") &
+                                                         Cultivar == "Alkar"), factor = "Irrigation")
+  # 92 significant OTUs.
+
+sigtab.jose.byirrigation <- func.deseq(subset_samples(rar.16s,
+                                                      SampleType == "Rhizosphere" & Irrigation %in% c("T1", "T4") &
+                                                        Cultivar == "Jose"), factor = "Irrigation")
+  # 1 significant OTUs.
+
+  ####################
+  ## T4/T1 - Alkar. ##
+  ####################
+
+# Class order
+sigtab.alkar.byirrigation$Class[which(!sigtab.alkar.byirrigation$Class %in% class_levels)] <- "Other"
+sigtab.alkar.byirrigation$Class = factor(as.character(sigtab.alkar.byirrigation$Class), levels= class_levels)
+
+# Order the genera by their max fold change.
+gen.order.alkar = tapply(sigtab.alkar.byirrigation$log2FoldChange, sigtab.alkar.byirrigation$Genus, function(x) max(x))
+gen.order.alkar = sort(gen.order.alkar, TRUE)
+sigtab.alkar.byirrigation$Genus = factor(as.character(sigtab.alkar.byirrigation$Genus), levels=names(gen.order.alkar))
+
+# Remove the unknown genera.
+sigtab.alkar.byirrigation <- sigtab.alkar.byirrigation[sigtab.alkar.byirrigation$Genus != "?",]
+
+  #######################
+  ## Rhizosphere - T4. ##
+  #######################
+
+# Class order
+sigtab.jose.byirrigation$Class[which(!sigtab.jose.byirrigation$Class %in% class_levels)] <- "Other"
+sigtab.jose.byirrigation$Class = factor(as.character(sigtab.jose.byirrigation$Class), levels= class_levels)
+
+# Order the genera by their max fold change.
+gen.order.jose = tapply(sigtab.jose.byirrigation$log2FoldChange, sigtab.jose.byirrigation$Genus, function(x) max(x))
+gen.order.jose = sort(gen.order.jose, TRUE)
+sigtab.jose.byirrigation$Genus = factor(as.character(sigtab.jose.byirrigation$Genus), levels=names(gen.order.jose))
+
+# Remove the unknown genera.
+sigtab.jose.byirrigation <- sigtab.jose.byirrigation[sigtab.jose.byirrigation$Genus != "?",]
+
+  #####################
+  ## Plot these out. ##
+  #####################
+
+deseqtaxa.byirrigation.alkar <- ggplot(sigtab.alkar.byirrigation,
+                                       aes(x=Genus, y=log2FoldChange, color=Class)) +
+  geom_point(size = 6.5, color = "black") +
+  geom_point(size=6) + 
+  theme(axis.text.x = element_text(angle = -90, hjust = 0, vjust=0.5)) +
+  scale_color_manual(values = class.palette, drop = FALSE) +
+  ggtitle("\nDESeq - Differentially Abundant OTUs by Irrigation\nT4/T1 - Alkar Rhizosphere")
+
+deseqtaxa.byirrigation.jose <- ggplot(sigtab.jose.byirrigation,
+                                      aes(x=Genus, y=log2FoldChange, color=Class)) +
+  geom_point(size = 6.5, color = "black") +
+  geom_point(size=6) + 
+  theme(axis.text.x = element_text(angle = -90, hjust = 0, vjust=0.5)) +
+  scale_color_manual(values = class.palette, drop = FALSE) +
+  ggtitle("\n\nJose") + xlab("\n\n\n")
+
+  #####################
+  ## Plot these out. ##
+  #####################
+
+deseq_themes <- list(theme(plot.title = element_text(size = 24, face = "bold", hjust = 0.5),
+                           axis.title = element_text(size = 18, face = "bold"),
+                           legend.text = element_text(size = 16),
+                           legend.title = element_text(size = 20),
+                           axis.text = element_text(size = 14)),
+                     geom_hline(yintercept=0, linetype="dashed", color = "gray75"))
+
+# Make the first part of the Supplemental Figure 6, with just the relative abundance plots.
+x <- plot_grid(class_plot.rhizosphere.cultivar + nl,
+          class_plot.rhizosphere.cultivar.byirrigation + nl,
+          class_plot.rhizosphere.cultivar.bydepth + nl +
+            theme(legend.position = "right"),
+          ncol = 3, rel_widths = c(0.65, 0.95, 1.4), labels = c("A)", "B)", "C)"), label_size = 24)
+
+deseq_irrigationbycultivar <- plot_grid(deseqtaxa.byirrigation.alkar + deseq_themes + theme(legend.position = "none"),
+                                        deseqtaxa.byirrigation.jose + deseq_themes + theme(legend.position = "none") +
+                                          theme(axis.title.y = element_blank()),
+          ncol = 2, rel_widths = c(1.8, 0.2), labels = c("\nD)", ""), label_size = 24)
+
+# Join the plots together with the DESeq plot to make the full Supplemental Figure 6.
+cultivar_relabundance_with_deseq <- plot_grid(x, deseq_irrigationbycultivar, nrow = 2)
+
+# Save it as a JPEG.
+ggsave("../submission_figures/SupplementalFigure6.jpg", plot = cultivar_relabundance_with_deseq,
+       width = 16, height = 16, scale = 1.1, dpi = 400)
+
+
+```
+
+
+### 4) Polyserial correlations.
+
+## 4.1) Class fold changes over time.
+
+```{r 4.1-class-fold-change, echo = FALSE, warning = FALSE}
+
+########################
+### Class dataframe. ###
+########################
+
+# Making a line plot with irrigation levels as the x-axis, and individual lines for all sampletype * timepoint combinations.
+# Note: the summarySE() function comes from the 'Rmisc' package.
+class.changes <- relabundance_melttable(rar.16s, n = 10, rank = "Class") %>% mutate(Abundance = Abundance / rardepth)
+df.classchanges <- summarySE(class.changes, measurevar = "Abundance", groupvars = c("Class", "SampleType", "Irrigation", "Date"))
+df.classchanges$SampleType_Date <- paste(df.classchanges$SampleType, df.classchanges$Date, sep = "_") %>%
+  factor(., levels = c("BulkSoil_04292020", "BulkSoil_07072020","BulkSoil_10152020",
+                       "Rhizosphere_07072020","Rhizosphere_10152020"))
+
+# This code below is modified from this source: http://www.cookbook-r.com/Graphs/Plotting_means_and_error_bars_(ggplot2)
+# We're using standard error of the mean as the basis for error bars.
+
+#################################################
+## Graphing all samples at once by irrigation. ##
+#################################################
+
+class.linechanges.full_plot <- ggplot(df.classchanges, aes(x=Irrigation, y=Abundance, colour=SampleType_Date)) + 
+  scale_colour_manual(values = c(brewer.pal(4, "Reds")[c(2:4)], brewer.pal(4, "Blues")[c(2,4)])) +
+  geom_errorbar(aes(ymin=Abundance-se, ymax=Abundance+se), width=.1) +
+  geom_smooth(aes(group = SampleType_Date, colour = SampleType_Date), size = 2.5) + facet_wrap(Class ~ SampleType, scales = "free", nrow = 11) +
+  geom_point(position = position_dodge(0.1)) + classthemes +
+  theme(strip.text.x = element_text(size = 11, face = "bold"), legend.position = "right",
+        strip.background = element_rect(color = "black", fill = "grey90")) + ggtitle("Relative Abundance Shifts over Irrigation, by Class")
+
+# plot_grid(class.linechanges.soil_plot, class.linechanges.rhizo_plot, ncol = 1) %>% 
+  # save_plot("../figures/relativeabundance/class_relativeabundance_byirrigation_linegraph.pdf", plot = class.linechanges.full_plot, ncol = 1, base_width = 18, base_height = 4, scale = 1.5)
+
+# Having the x-axis be depth instead of irrigation.
+
+df.classchanges_bydepth <- summarySE(class.changes, measurevar = "Abundance", groupvars = c("Class", "SampleType", "Depth", "Date"))
+df.classchanges_bydepth$SampleType_Date <- paste(df.classchanges_bydepth$SampleType, df.classchanges_bydepth$Date, sep = "_") %>%
+  factor(., levels = c("BulkSoil_04292020", "BulkSoil_07072020","BulkSoil_10152020", "Rhizosphere_07072020", "Rhizosphere_10152020"))
+  
+class.linechanges.full_plot.depth <- ggplot(df.classchanges_bydepth, aes(x=Depth, y=Abundance, colour=SampleType_Date)) + 
+  scale_colour_manual(values = c(brewer.pal(4, "Reds")[c(2:4)], brewer.pal(4, "Blues")[c(2,4)])) +
+  geom_errorbar(aes(ymin=Abundance-se, ymax=Abundance+se), width=.1) +
+  geom_smooth(aes(group = SampleType_Date, colour = SampleType_Date), size = 2.5) + facet_wrap(Class ~ SampleType, scales = "free", nrow = 11) +
+  geom_point(position = position_dodge(0.1)) + classthemes + 
+  theme(strip.text.x = element_text(size = 11, face = "bold"), legend.position = "none",
+        strip.background = element_rect(color = "black", fill = "grey90")) + ggtitle("Relative Abundance Shifts over Depth, by Class")
+
+# # plot_grid(class.linechanges.soil_plot, class.linechanges.rhizo_plot, ncol = 1) %>% 
+#   save_plot("../figures/relativeabundance/class_relativeabundance_byirrigation_linegraph.pdf", plot = class.linechanges.full_plot, ncol = 1, base_width = 18, base_height = 4, scale = 1.5)
+
+# Join these with the relative abundance plots to get Figure 3.
+class_relabundance_plots <- plot_grid(class_plot.irrigation, class_plot.depth, labels = c("a)", "b)"), label_size = 24, nrow = 2, rel_heights = c(0.9, 1.1))
+
+class_linegraphs <- plot_grid(class.linechanges.full_plot, class.linechanges.full_plot.depth, labels = c("c)", "d)"), label_size = 24, ncol = 2, rel_widths = c(1.1, 0.9))
+
+plot_grid(class_relabundance_plots, class_linegraphs, ncol = 2, rel_widths = c(0.7, 1.3)) %>% 
+  save_plot("../figures/relativeabundance/class_irrigation_depth_Figure3.pdf", plot = ., base_width = 20, base_height = 15, scale = 1.5)
+
+```
+
+
+
+```{r 4.1.1-significance-of-irrigation-by-date-for-individual-classes}
+
+df.classabundance <- relabundance_melttable(rar.16s, n = 20, rank = "Class") %>%
+  reshape2::dcast(data = .,
+                  Name + FieldPosition + Cultivar + Irrigation + Depth + Date + SampleType + SampleType_Irrigation~ Class,
+                  value.var = "Abundance")
+
+# Change the SampleType_Irrigation to SampleType_Date.
+df.classabundance$SampleType_Irrigation <- paste(df.classabundance$SampleType, df.classabundance$Date, sep = "_") %>%
+  factor(., levels = c("BulkSoil_04292020", "BulkSoil_07072020","BulkSoil_10152020",
+                       "Rhizosphere_07072020","Rhizosphere_10152020"))
+
+colnames(df.classabundance) <- gsub("\\(", "", colnames(df.classabundance)) %>%
+  gsub("\\)", "", .) %>% gsub("-", "_", .)
+
+class.names <- colnames(df.classabundance)[c(9:29)]
+
+###############################################################################################
+### Which classes have a significantly different abundance pattern over irrigation by date? ###
+###############################################################################################
+
+# Start with the soil samples.
+for(i in 1:length(class.names)){
+  f <- as.formula(paste(class.names[i], "~ Irrigation * Depth * Date + Cultivar", sep = " "))
+  x <- summary(aov(data = df.classabundance[df.classabundance$SampleType == "BulkSoil",], f))
+  
+  # A somewhat effective way to convert the summary to a dataframe below.
+  y <- data.frame(unclass(x))
+  rownames(y) <- str_trim(rownames(y))
+  
+  ir.date.sig <- y["Irrigation:Date","Pr..F."]
+  if(ir.date.sig < 0.05){
+    print(class.names[i])
+    print(ir.date.sig)
+  }
+}
+
+  ## CONCLUSION => in bulk soil, the classes that had significantly different irrigation trends by date included Actinobacteria,
+  ## Alphaproteobacteria, Bacilli, Betaproteobacteria, Cytophagia, and Deltaproteobacteria.
+
+##########################################
+## Now go onto the rhizosphere samples. ##
+##########################################
+
+for(i in 1:length(class.names)){
+  f <- as.formula(paste(class.names[i], "~ Irrigation * Depth * Date + Cultivar", sep = " "))
+  x <- summary(aov(data = df.classabundance[df.classabundance$SampleType == "Rhizosphere",], f))
+  
+  # A somewhat effective way to convert the summary to a dataframe below.
+  y <- data.frame(unclass(x))
+  rownames(y) <- str_trim(rownames(y))
+  
+  ir.date.sig <- y["Irrigation:Date","Pr..F."]
+  if(ir.date.sig < 0.05){
+    print(class.names[i])
+    print(ir.date.sig)
+  }
+}
+
+  ## CONCLUSION => in rhizospheres, the classes that had significantly different irrigation trends by date 
+  ## included Chloroflexi Subdivision 10 and Subgroup 6.
+
+```
+
+# 4.1.2) Irrigation by depth - class-level significances.
+
+```{r 4.1.2-significance-of-irrigation-by-depth-for-individual-classes}
+
+################################################################################################
+### Which classes have a significantly different abundance pattern over depth by irrigation? ###
+################################################################################################
+
+sig.class_notbycultivar <- function(class.names = class.names, df.classabundance = df.classabundance,
+                                    factor_of_interest = "Cultivar", factors = "~ Irrigation * Depth * Date * Cultivar",
+                      interactive_effect = FALSE){
+  
+  df.classbycultivar <- data.frame(Class = character(), significance = numeric())
+
+  for(i in 1:length(class.names)){
+    f <- as.formula(paste(class.names[i], factors, sep = " "))
+    x <- summary(aov(data = df.classabundance, f))
+    
+    # A somewhat effective way to convert the summary to a dataframe below.
+    y <- data.frame(unclass(x))
+    rownames(y) <- str_trim(rownames(y))
+    
+    cultivar.sig <- y[factor_of_interest,"Pr..F."]
+    
+    if(cultivar.sig < 0.05){
+      print(class.names[i])
+      print(cultivar.sig)
+      
+      toappend <- data.frame(Class = class.names[i], significance = cultivar.sig)
+      
+      df.classbycultivar <- rbind(df.classbycultivar, toappend)
+    }
+  }
+  row.names(df.classbycultivar) <- NULL
+  return(df.classbycultivar)
+}
+
+df.class.bulksoil <- df.classabundance[df.classabundance$SampleType == "BulkSoil",]
+df.bulksoil.interactiveeffects <- sig.class_notbycultivar(class.names = class.names, df.classabundance = df.class.bulksoil, factor_of_interest = "Irrigation:Depth",  factors = "~ Irrigation * Depth * Date * Cultivar")
+
+  ## CONCLUSION => Acidimicrobiia, Actinobacteria, Chitinophagia, Chloroflexi subdivision 10,
+  ## Cytophagia, Deltaproteobacteria, Gammaproteobacteria, Holophagae, Nitrososphaeria,
+  ## Planctomycetacia, and Subgroup 6 all have different irrigation trends by depth 
+  ## (or depth trends by irrigation), in bulk soils.
+
+##################################
+## Now moving onto Rhizosphere. ##
+##################################
+
+df.class.rhizosphere <- df.classabundance[df.classabundance$SampleType == "Rhizosphere",]
+df.rhizosphere.interactiveeffects <- sig.class_notbycultivar(class.names = class.names,
+                                                             df.classabundance = df.class.rhizosphere,
+                                                             factor_of_interest = "Irrigation:Depth",
+                                                             factors = "~ Irrigation * Depth * Date * Cultivar")
+
+
+  ## CONCLUSION => in rhizosphere there are no classes that have a significantly different irrigation trend by depth
+  ## (indicating they remain fairly homogenous down their length).
+
+```
+
+# 4.1.3) Depth by date - class-level significances.
+
+```{r 4.1.3-significance-of-depth-by-date-for-individual-classes}
+
+##########################################################################################
+### Which classes have a significantly different abundance pattern over depth by date? ###
+##########################################################################################
+
+for(i in 1:length(class.names)){
+  f <- as.formula(paste(class.names[i], "~ Irrigation * Depth * Date + Cultivar", sep = " "))
+  x <- summary(aov(data = df.classabundance[df.classabundance$SampleType == "BulkSoil",], f))
+  
+  # A somewhat effective way to convert the summary to a dataframe below.
+  y <- data.frame(unclass(x))
+  rownames(y) <- str_trim(rownames(y))
+  
+  date.depth.sig <- y["Depth:Date","Pr..F."]
+  if(date.depth.sig < 0.05){
+    print(class.names[i])
+    print(date.depth.sig)
+  }
+}
+
+  ## CONCLUSION => Cytophagia and Holophagae are the only classes to have significantly
+  ## different depth patterns by date in bulk soils.
+
+for(i in 1:length(class.names)){
+  f <- as.formula(paste(class.names[i], "~ Irrigation * Depth * Date + Cultivar", sep = " "))
+  x <- summary(aov(data = df.classabundance[df.classabundance$SampleType == "Rhizosphere",], f))
+  
+  # A somewhat effective way to convert the summary to a dataframe below.
+  y <- data.frame(unclass(x))
+  rownames(y) <- str_trim(rownames(y))
+  
+  date.depth.sig <- y["Depth:Date","Pr..F."]
+  if(date.depth.sig < 0.05){
+    print(class.names[i])
+    print(date.depth.sig)
+  }
+}
+
+  ## CONCLUSION => in rhizosphere, Betaproteobacteria and Blastocatellia have different depth trends by date.
+
+
+```
+
+```{r 4.1.4-significance-of-cultivar-for-individual-classes}
+
+#####################################################################################
+### Which classes have a significantly different abundance pattern over cultivar? ###
+#####################################################################################
+
+sig.class <- function(class.names = class.names, df.classabundance = df.classabundance, factor_of_interest = "Cultivar", factors = "~ Irrigation * Depth * Date * Cultivar"){
+  
+  df.classbycultivar <- data.frame(Class = character(), significance = numeric(), Alkar_avg = numeric(), Jose_avg = numeric(),
+                                 Alkar_Tukeygroup = character(), Jose_Tukeygroup = character())
+  j <- 1
+  for(i in 1:length(class.names)){
+    f <- as.formula(paste(class.names[i], factors, sep = " "))
+    x <- summary(aov(data = df.classabundance, f))
+    
+    # A somewhat effective way to convert the summary to a dataframe below.
+    y <- data.frame(unclass(x))
+    rownames(y) <- str_trim(rownames(y))
+    
+    cultivar.sig <- y[factor_of_interest,"Pr..F."]
+    
+    if(cultivar.sig < 0.05){
+      print(class.names[i])
+      print(cultivar.sig)
+      z <- (HSD.test(aov(data = df.classabundance, f), factor_of_interest, group = TRUE)$groups)
+      
+      j <- j+1
+      
+      toappend <- data.frame(Class = class.names[i], significance = cultivar.sig, Alkar_avg = z["Alkar",1], Jose_avg = z["Jose",1],
+                           Alkar_Tukeygroup = z["Alkar",2], Jose_Tukeygroup = z["Jose",2])
+      
+      df.classbycultivar <- rbind(df.classbycultivar, toappend)
+      
+    }
+  }
+  row.names(df.classbycultivar) <- NULL
+  return(df.classbycultivar)
+}
+
+
+df.classrhizosphere <- df.classabundance[df.classabundance$SampleType == "Rhizosphere",]
+
+df.cbyc <- sig.class(df.classabundance = df.classrhizosphere, class.names = class.names, factor_of_interest = "Cultivar")
+
+
+  ## CONCLUSION - these classes are significantly different by Cultivar => 
+    ## Acidimicrobiia (higher in Alkar)
+    ## Alphaproteobacteria (higher in Jose)
+    ## Blastocatellia (higher in Alkar)
+    ## Chloroflexi (subdivision) (higher in Alkar)
+    ## Gemmatimonadetes (class) (higher in Alkar)
+    ## Subgroup 6 (higher in Alkar)
+
+## Repeat for each timepoint. Do July first.
+
+df.classrhizosphere.july <- df.classabundance[df.classabundance$SampleType == "Rhizosphere" & df.classabundance$Date == "07072020",]
+
+df.cbyc.july <- sig.class(df.classabundance = df.classrhizosphere.july, class.names = class.names, factor_of_interest = "Cultivar",
+                          factors = "~ Irrigation * Depth * Cultivar")
+
+View(df.cbyc.july)
+
+  ## CONCLUSION - at July, these classes are significantly different by Cultivar => 
+    ## Acidimicrobiia (higher in Alkar)
+    ## Alphaproteobacteria (higher in Jose)
+    ## Betaproteobacteria (higher in Alkar)
+    ## Blastocatellia (higher in Alkar)
+    ## Chloroflexi (subdivision) (higher in Alkar)
+    ## Gemmatimonadetes (class) (higher in Alkar)
+    ## Planctomycetacia (higher in Jose)
+    ## Subgroup 6 (higher in Alkar)
+    ## Thermoleophilia (higher in Alkar)
+
+## Repeat for each timepoint. October second
+
+df.classrhizosphere.oct <- df.classabundance[df.classabundance$SampleType == "Rhizosphere" & df.classabundance$Date == "10152020",]
+
+df.cbyc.oct <- sig.class(df.classabundance = df.classrhizosphere.oct, class.names = class.names, factor_of_interest = "Cultivar",
+                          factors = "~ Irrigation * Depth * Cultivar")
+
+  ## CONCLUSION - at October, there were no classes significantly differentiated by cultivar. 
+
+###################################################################################################
+### Which classes have a significantly different abundance pattern over cultivar by irrigation? ###
+###################################################################################################
+
+# df.cultbyirr <- sig.class(df.classabundance = df.classrhizosphere, class.names = class.names, factor_of_interest = "Irrigation:Cultivar",
+#                           factors = "~ Irrigation * Depth * Date * Cultivar")
+
+  ## CONCLUSION => Alphaproteobacteria, Bacilli, Deltaproteobacteria, Gemmatimonadetes (class), Phycisphaerae, Thermoleophilia, and 'other' all have different abundance patterns between
+  ## cultivars depending on the irrigation regime.
+
+#########################################################################################################
+### Which classes have a significantly different abundance pattern over cultivar by at the T4 regime? ###
+#########################################################################################################
+
+df.classrhizosphere.T4 <- df.classabundance[df.classabundance$SampleType == "Rhizosphere" & df.classabundance$Irrigation == "T4",]
+
+df.cbyc.t4 <- sig.class(df.classabundance = df.classrhizosphere.T4, class.names = class.names, factor_of_interest = "Cultivar",
+                          factors = "~ Depth * Date * Cultivar")
+
+
+  ## CONCLUSION => at the T4 regime, these are significantly differentially abundant by cultivar:
+    ## Bacilli (higher in Jose)
+    ## Blastocatellia group 4 (higher in Alkar)
+    ## Gemmatimonadetes (class) (higher in Alkar)
+    ## Phycisphaerae (higher in Alkar)
+    ## Subgroup 6 (higher in Alkar)
+
+#########################################################################################################
+### Which classes have a significantly different abundance pattern over cultivar by at the T1 regime? ###
+#########################################################################################################
+
+df.classrhizosphere.T1 <- df.classabundance[df.classabundance$SampleType == "Rhizosphere" & df.classabundance$Irrigation == "T1",]
+
+df.cbyc.t1 <- sig.class(df.classabundance = df.classrhizosphere.T1, class.names = class.names, factor_of_interest = "Cultivar",
+                          factors = "~ Depth * Date * Cultivar")
+
+  ## CONCLUSION => at the T1 regime, these are significantly differentially abundant by cultivar:
+    ## Acidimicrobiia (higher in Alkar)
+    ## Alphaproteobacteria (equal?)
+    ## Deltaproteobacteria (higher in Alkar)
+    ## 'Other' (higher in Alkar)
+
+```
+
+## 4.2) Polyserial correlations.
+
+Polyserial correlations can be used to assess the correlation (and its standard error) between a quantitative variable and
+ordinal variables.
+
+# 4.2.1) Polyserial correlation function.
+
+```{r 4.2.1-polyserial-correlations-functions}
+
+# This is a modified version of the above function; it uses the polyserial() function from within the 'polycor' package.
+
+# IMPORTANT: notes on calculating the p-value significance of the polyserial results can be seen here:
+  # https://stackoverflow.com/questions/16281667/p-value-for-polyserial-correlation
+
+get_polycorrelations <- function(rar, rank = "Phylum", factor = "Irrigation", ntaxa = 20, sig.subset = TRUE){
+  
+  phy <- relabundance_melttable(phy = rar, n = ntaxa, rank = rank)
+  
+  taxa_list <- sort(unique(phy[,rank])) 
+  
+  # We need to convert the dataframe to a casted version with the taxa as separate columns.
+    # Create a formula to use in the dcast function.
+  formula <- paste(colnames(phy)[!colnames(phy) %in% c(rank, "Abundance")], collapse = " + ") %>%
+    paste(., "~", rank, sep = " ") %>% as.formula(.)
+
+    # Cast the data frame so each of the taxa is its own column
+  phy.cast <- reshape2::dcast(data = phy, formula, value.var = "Abundance", fun.aggregate = sum)
+  
+  # Initialize a dataframe to be returned.
+  cor.return <- data.frame(Factor = character(), Rank = character(), Taxa = character(),
+                           EffectSize = numeric(), Significance = numeric())
+  
+  # Now get the correlations.
+  for(taxa in taxa_list){
+    # Run the correlation test. By default this uses Pearson correlation; we can modify it either below or as an argument to be Spearman; I think they generally give similar results.
+    ps.res <- polyserial(phy.cast[,taxa], as.numeric(phy.cast[,factor]), ML = TRUE, std.err = TRUE)
+    
+    std.err_ML <- sqrt(ps.res$var[1,1])
+    p.value <- 2 * pnorm(-abs(ps.res$rho / std.err_ML)) 
+
+    cor.toadd <- data.frame(Factor = factor, Rank = rank, Taxa = taxa,
+                            EffectSize = ps.res$rho, Significance = p.value)
+    rownames(cor.toadd) <- NULL
+    cor.return <- rbind(cor.return, cor.toadd)
+  }
+  
+  if(sig.subset){
+    cor.return <- cor.return %>% filter(Significance < 0.05)
+  }
+  
+  return(cor.return)
+}
+
+```
+
+
+# 4.2.2) Polyserial correlations by irrigation level, segregated by sample type and date.
+
+```{r 4.2.2-polyserialcorrelations-by-irrigation}
+
+fulldataset.irrigation.classpolycorrelations <- get_polycorrelations(rar.16s, rank = "Class", factor = "Irrigation", ntaxa = 20)
+
+    ##########################################
+    ### Class enrichment trends for soils. ###
+    ##########################################
+
+###################################################################################################################
+### Check to see the different enrichment trends over irrigation for different sample type x date combinations. ###
+###################################################################################################################
+
+alldates.irrigation.classpolycorrelations <- get_polycorrelations(subset_samples(rar.16s),
+                                                                  rank = "Class", factor = "Irrigation", ntaxa = 25)
+
+alldates.soil.irrigation.classpolycorrelations <- get_polycorrelations(subset_samples(rar.16s, SampleType == "BulkSoil"),
+                                                                       rank = "Class", factor = "Irrigation", ntaxa = 25)
+
+alldates.rhizosphere.irrigation.classpolycorrelations <- get_polycorrelations(subset_samples(rar.16s, SampleType == "Rhizosphere"),
+                                                                              rank = "Class", factor = "Irrigation", ntaxa = 25)
+
+april.soil.irrigation.classpolycorrelations <- get_polycorrelations(subset_samples(rar.16s, SampleType == "BulkSoil" &
+                                                                                     Date == "04292020"),
+                                                                    rank = "Class", factor = "Irrigation", ntaxa = 25)
+
+july.soil.irrigation.classpolycorrelations <- get_polycorrelations(subset_samples(rar.16s,
+                                                                                  SampleType == "BulkSoil" & Date == "07072020"),
+                                                                   rank = "Class", factor = "Irrigation", ntaxa = 25)
+
+july.rhizo.irrigation.classpolycorrelations <- get_polycorrelations(subset_samples(rar.16s,
+                                                                                   SampleType == "Rhizosphere" & Date == "07072020"),
+                                                                    rank = "Class", factor = "Irrigation", ntaxa = 25)
+
+oct.soil.irrigation.classpolycorrelations <- get_polycorrelations(subset_samples(rar.16s,
+                                                                                 SampleType == "BulkSoil" & Date == "10152020"),
+                                                                  rank = "Class", factor = "Irrigation", ntaxa = 25)
+
+oct.rhizo.irrigation.classpolycorrelations <- get_polycorrelations(subset_samples(rar.16s,
+                                                                                  SampleType == "Rhizosphere" & Date == "10152020"),
+                                                                   rank = "Class", factor = "Irrigation", ntaxa = 25)
+
+
+# Join these together.
+
+fulldataset.irrigationtrends <- full_join(select(alldates.irrigation.classpolycorrelations, -Factor, -Rank),
+                                      select(alldates.soil.irrigation.classpolycorrelations, -Factor, -Rank),
+                                      by = "Taxa", suffix = c(".AllDatesAllSampleTypes", ".AllDatesSoilOnly")) %>%
+  full_join(., select(alldates.rhizosphere.irrigation.classpolycorrelations, -Factor, -Rank), by = "Taxa") %>% 
+  dplyr::rename(EffectSize.AllDatesRhizosphereOnly = EffectSize, Significance.AllDatesRhizosphereOnly = Significance) %>%
+  full_join(., select(april.soil.irrigation.classpolycorrelations, -Factor, -Rank), by = "Taxa") %>% 
+  dplyr::rename(EffectSize.AprilSoilOnly = EffectSize, Significance.AprilSoilOnly = Significance) %>%
+  full_join(., select(july.soil.irrigation.classpolycorrelations, -Factor, -Rank), by = "Taxa") %>% 
+  dplyr::rename(EffectSize.JulySoilOnly = EffectSize, Significance.JulySoilOnly = Significance) %>%
+  full_join(., select(july.rhizo.irrigation.classpolycorrelations, -Factor, -Rank), by = "Taxa") %>% 
+  dplyr::rename(EffectSize.JulyRhizosphereOnly = EffectSize, Significance.JulyRhizosphereOnly = Significance) %>%
+  full_join(., select(oct.soil.irrigation.classpolycorrelations, -Factor, -Rank), by = "Taxa") %>% 
+  dplyr::rename(EffectSize.OctSoilOnly = EffectSize, Significance.OctSoilOnly = Significance) %>%
+  full_join(., select(oct.rhizo.irrigation.classpolycorrelations, -Factor, -Rank), by = "Taxa") %>% 
+  dplyr::rename(EffectSize.OctRhizosphereOnly = EffectSize, Significance.OctRhizosphereOnly = Significance)
+  
+write_xlsx(fulldataset.irrigationtrends, "../figures/polyserialcorrelations/fulldataset_irrigation_polycorrelations_overall.xlsx")
+
+```
+
+# 4.2.3) Polyserial correlations for classes over different soil depths.
+
+```{r 4.2.3-polyserialcorrelations-by-depth}
+
+    ##########################################
+    ### Class enrichment trends for soils. ###
+    ##########################################
+
+##############################################################################################################
+### Check to see the different enrichment trends over depth for different sample type x date combinations. ###
+##############################################################################################################
+
+alldates.depth.classpolycorrelations <- get_polycorrelations(subset_samples(rar.16s),
+                                                             rank = "Class", factor = "Depth", ntaxa = 25)
+alldates.soil.depth.classpolycorrelations <- get_polycorrelations(subset_samples(rar.16s,
+                                                                                 SampleType == "BulkSoil"),
+                                                                  rank = "Class", factor = "Depth", ntaxa = 25)
+
+alldates.rhizosphere.depth.classpolycorrelations <- get_polycorrelations(subset_samples(rar.16s, SampleType == "Rhizosphere"),
+                                                                         rank = "Class", factor = "Depth", ntaxa = 25)
+
+april.soil.depth.classpolycorrelations <- get_polycorrelations(subset_samples(rar.16s,
+                                                                              SampleType == "BulkSoil" & Date == "04292020"),
+                                                               rank = "Class", factor = "Depth", ntaxa = 25)
+
+july.soil.depth.classpolycorrelations <- get_polycorrelations(subset_samples(rar.16s,
+                                                                             SampleType == "BulkSoil" & Date == "07072020"),
+                                                              rank = "Class", factor = "Depth", ntaxa = 25)
+
+july.rhizo.depth.classpolycorrelations <- get_polycorrelations(subset_samples(rar.16s,
+                                                                              SampleType == "Rhizosphere" & Date == "07072020"),
+                                                               rank = "Class", factor = "Depth", ntaxa = 25)
+
+oct.soil.depth.classpolycorrelations <- get_polycorrelations(subset_samples(rar.16s,
+                                                                            SampleType == "BulkSoil" & Date == "10152020"),
+                                                             rank = "Class", factor = "Depth", ntaxa = 25)
+
+oct.rhizo.depth.classpolycorrelations <- get_polycorrelations(subset_samples(rar.16s,
+                                                                             SampleType == "Rhizosphere" & Date == "10152020"),
+                                                              rank = "Class", factor = "Depth", ntaxa = 25)
+
+
+# Join these together.
+
+fulldataset.depthtrends <- full_join(select(alldates.depth.classpolycorrelations, -Factor, -Rank),
+                                      select(alldates.soil.depth.classpolycorrelations, -Factor, -Rank),
+                                     by = "Taxa", suffix = c(".AllDatesAllSampleTypes", ".AllDatesSoilOnly")) %>%
+  full_join(., select(alldates.rhizosphere.depth.classpolycorrelations, -Factor, -Rank), by = "Taxa") %>% 
+  dplyr::rename(EffectSize.AllDatesRhizosphereOnly = EffectSize, Significance.AllDatesRhizosphereOnly = Significance) %>%
+  full_join(., select(april.soil.depth.classpolycorrelations, -Factor, -Rank), by = "Taxa") %>% 
+  dplyr::rename(EffectSize.AprilSoilOnly = EffectSize, Significance.AprilSoilOnly = Significance) %>%
+  full_join(., select(july.soil.depth.classpolycorrelations, -Factor, -Rank), by = "Taxa") %>% 
+  dplyr::rename(EffectSize.JulySoilOnly = EffectSize, Significance.JulySoilOnly = Significance) %>%
+  full_join(., select(july.rhizo.depth.classpolycorrelations, -Factor, -Rank), by = "Taxa") %>% 
+  dplyr::rename(EffectSize.JulyRhizosphereOnly = EffectSize, Significance.JulyRhizosphereOnly = Significance) %>%
+  full_join(., select(oct.soil.depth.classpolycorrelations, -Factor, -Rank), by = "Taxa") %>% 
+  dplyr::rename(EffectSize.OctSoilOnly = EffectSize, Significance.OctSoilOnly = Significance) %>%
+  full_join(., select(oct.rhizo.depth.classpolycorrelations, -Factor, -Rank), by = "Taxa") %>% 
+  dplyr::rename(EffectSize.OctRhizosphereOnly = EffectSize, Significance.OctRhizosphereOnly = Significance)
+  
+write_xlsx(fulldataset.depthtrends, "../figures/polyserialcorrelations/fulldataset_depth_polycorrelations_overall.xlsx")
+
+```
+
+# 4.2.4 - Polyserial correlations by depth for individual cultivars.
+
+```{r 4.2.4-polyserialcorrelations-by-depth-by-cultivar}
+
+    ################################################
+    ### Class enrichment trends for rhizosphere. ###
+    ################################################
+
+# All dates.
+rhizo.depth.alkar.classpolycorrelations <- get_polycorrelations(subset_samples(rar.16s,
+                                                                               SampleType == "Rhizosphere" & Cultivar == "Alkar"),
+                                                                     rank = "Class", factor = "Depth", ntaxa = 25)
+
+  # Conclusion => 1 class correlation (Spartobacteria is negatively associated with depth).
+
+rhizo.depth.jose.classpolycorrelations <- get_polycorrelations(subset_samples(rar.16s,
+                                                                              SampleType == "Rhizosphere" & Cultivar == "Jose"),
+                                                               rank = "Class", factor = "Depth", ntaxa = 25)
+  # Conclusion => 4 class correlations (Chloroflexi subdivision 10 and subgroup 5 are negatively correlated, Bacilli and Thermomicrobia are positively correlated with depth.)
+
+# July dates.
+july.rhizo.depth.alkar.classpolycorrelations <- get_polycorrelations(subset_samples(rar.16s,
+                                                                                    SampleType == "Rhizosphere" &
+                                                                                      Date == "07072020" &
+                                                                                      Cultivar == "Alkar"),
+                                                                     rank = "Class", factor = "Depth", ntaxa = 25)
+  # Conclusion => 2 class correlations (Spartobacteria and Subroup 6 are negatively correlated).
+
+july.rhizo.depth.jose.classpolycorrelations <- get_polycorrelations(subset_samples(rar.16s,
+                                                                                   SampleType == "Rhizosphere" &
+                                                                                     Date == "07072020" &
+                                                                                     Cultivar == "Jose"),
+                                                               rank = "Class", factor = "Depth", ntaxa = 25)
+  # Conclusion => 6 class correlations (Bacilli and Thermomicrobia are positively correlated,
+  # Betaproteobacteria, Gemmatimonadetes, Phycisphaerae, and Subgroup 6 are negatively correlated.)
+
+# October dates.
+oct.rhizo.depth.alkar.classpolycorrelations <- get_polycorrelations(subset_samples(rar.16s,
+                                                                                   SampleType == "Rhizosphere" &
+                                                                                     Date == "10152020" &
+                                                                                     Cultivar == "Alkar"),
+                                                                     rank = "Class", factor = "Depth", ntaxa = 25)
+  # Conclusion => 3 class correlations (Cytophagia and Sphingobacteriia are negatively correlated,
+  # Desulfurellia are positively correlated.)
+
+oct.rhizo.depth.jose.classpolycorrelations <- get_polycorrelations(subset_samples(rar.16s,
+                                                                                  SampleType == "Rhizosphere" &
+                                                                                    Date == "10152020" &
+                                                                                    Cultivar == "Jose"),
+                                                               rank = "Class", factor = "Depth", ntaxa = 25)
+  # Conclusion => No class correlations.
+
+
+
+# Join these together.
+
+fulldataset.depthtrends <- full_join(select(alldates.depth.classpolycorrelations, -Factor, -Rank),
+                                      select(alldates.soil.depth.classpolycorrelations, -Factor, -Rank), by = "Taxa", suffix = c(".AllDatesAllSampleTypes", ".AllDatesSoilOnly")) %>%
+  full_join(., select(alldates.rhizosphere.depth.classpolycorrelations, -Factor, -Rank), by = "Taxa") %>% 
+  dplyr::rename(EffectSize.AllDatesRhizosphereOnly = EffectSize, Significance.AllDatesRhizosphereOnly = Significance) %>%
+  full_join(., select(april.soil.depth.classpolycorrelations, -Factor, -Rank), by = "Taxa") %>% 
+  dplyr::rename(EffectSize.AprilSoilOnly = EffectSize, Significance.AprilSoilOnly = Significance) %>%
+  full_join(., select(july.soil.depth.classpolycorrelations, -Factor, -Rank), by = "Taxa") %>% 
+  dplyr::rename(EffectSize.JulySoilOnly = EffectSize, Significance.JulySoilOnly = Significance) %>%
+  full_join(., select(july.rhizo.depth.classpolycorrelations, -Factor, -Rank), by = "Taxa") %>% 
+  dplyr::rename(EffectSize.JulyRhizosphereOnly = EffectSize, Significance.JulyRhizosphereOnly = Significance) %>%
+  full_join(., select(oct.soil.depth.classpolycorrelations, -Factor, -Rank), by = "Taxa") %>% 
+  dplyr::rename(EffectSize.OctSoilOnly = EffectSize, Significance.OctSoilOnly = Significance) %>%
+  full_join(., select(oct.rhizo.depth.classpolycorrelations, -Factor, -Rank), by = "Taxa") %>% 
+  dplyr::rename(EffectSize.OctRhizosphereOnly = EffectSize, Significance.OctRhizosphereOnly = Significance)
+  
+write_xlsx(fulldataset.depthtrends, "../figures/polyserialcorrelations/fulldataset_depth_polycorrelations_overall.xlsx")
+
+```
+
+
+# 4.2.5) Polyserial correlations by irrigation - segregated by depth.
+
+```{r 4.2.5-polyserialcorrelations-by-irrigation-segregated-by-depth}
+
+fulldataset.irrigation.classpolycorrelations <- get_polycorrelations(rar.16s, rank = "Class", factor = "Irrigation", ntaxa = 20)
+
+    ##########################################
+    ### Class enrichment trends for soils. ###
+    ##########################################
+
+#######################################################################################################
+### Check to see the different enrichment trends over irrigation for different depths in all soils. ###
+#######################################################################################################
+
+alldates.0to5cm.irrigation.classpolycorrelations <- get_polycorrelations(subset_samples(rar.16s,
+                                                                                        SampleType == "BulkSoil" &
+                                                                                          Depth == "0-5cm"),
+                                                                    rank = "Class", factor = "Irrigation", ntaxa = 20)
+
+alldates.5to15cm.irrigation.classpolycorrelations <- get_polycorrelations(subset_samples(rar.16s,
+                                                                                         SampleType == "BulkSoil" &
+                                                                                           Depth == "5-15cm"),
+                                                                    rank = "Class", factor = "Irrigation", ntaxa = 20)
+
+alldates.15to25cm.irrigation.classpolycorrelations <- get_polycorrelations(subset_samples(rar.16s,
+                                                                                          SampleType == "BulkSoil" &
+                                                                                            Depth == "15-25cm"),
+                                                                    rank = "Class", factor = "Irrigation", ntaxa = 20)
+
+alldates.soil.irrigation <- full_join(alldates.0to5cm.irrigation.classpolycorrelations,
+                                      select(alldates.5to15cm.irrigation.classpolycorrelations, -Factor, -Rank),
+                                      by = "Taxa", suffix = c(".0-5cm", ".5-15cm")) %>%
+  full_join(., select(alldates.15to25cm.irrigation.classpolycorrelations, -Factor, -Rank), by = "Taxa") %>%
+  dplyr::rename(EffectSize.15to25cm = EffectSize, Significance.15to25cm = Significance)
+
+
+#########################################################################################################
+### Check to see the different enrichment trends over irrigation for different depths in April soils. ###
+#########################################################################################################
+
+april.0to5cm.irrigation.classpolycorrelations <- get_polycorrelations(subset_samples(rar.16s,
+                                                                                     Date == "04292020" &
+                                                                                       SampleType == "BulkSoil" &
+                                                                                       Depth == "0-5cm"),
+                                                                    rank = "Class", factor = "Irrigation", ntaxa = 20)
+
+april.5to15cm.irrigation.classpolycorrelations <- get_polycorrelations(subset_samples(rar.16s,
+                                                                                      Date == "04292020" &
+                                                                                        SampleType == "BulkSoil" &
+                                                                                        Depth == "5-15cm"),
+                                                                    rank = "Class", factor = "Irrigation", ntaxa = 20)
+
+april.15to25cm.irrigation.classpolycorrelations <- get_polycorrelations(subset_samples(rar.16s,
+                                                                                       Date == "04292020" &
+                                                                                         SampleType == "BulkSoil" &
+                                                                                         Depth == "15-25cm"),
+                                                                    rank = "Class", factor = "Irrigation", ntaxa = 20)
+
+april.soil.irrigation <- full_join(april.0to5cm.irrigation.classpolycorrelations,
+                                      select(april.5to15cm.irrigation.classpolycorrelations, -Factor, -Rank),
+                                   by = "Taxa", suffix = c(".0-5cm", ".5-15cm")) %>%
+  full_join(., select(april.15to25cm.irrigation.classpolycorrelations, -Factor, -Rank), by = "Taxa") %>%
+  dplyr::rename(EffectSize.15to25cm = EffectSize, Significance.15to25cm = Significance)
+
+
+
+########################################################################################################
+### Check to see the different enrichment trends over irrigation for different depths in July soils. ###
+########################################################################################################
+
+july.0to5cm.irrigation.classpolycorrelations <- get_polycorrelations(subset_samples(rar.16s,
+                                                                                    Date == "07072020" &
+                                                                                      SampleType == "BulkSoil" &
+                                                                                      Depth == "0-5cm"),
+                                                                    rank = "Class", factor = "Irrigation", ntaxa = 20)
+
+july.5to15cm.irrigation.classpolycorrelations <- get_polycorrelations(subset_samples(rar.16s,
+                                                                                     Date == "07072020" &
+                                                                                       SampleType == "BulkSoil" &
+                                                                                       Depth == "5-15cm"),
+                                                                    rank = "Class", factor = "Irrigation", ntaxa = 20)
+
+july.15to25cm.irrigation.classpolycorrelations <- get_polycorrelations(subset_samples(rar.16s,
+                                                                                      Date == "07072020" &
+                                                                                        SampleType == "BulkSoil" &
+                                                                                        Depth == "15-25cm"),
+                                                                    rank = "Class", factor = "Irrigation", ntaxa = 20)
+
+july.soil.irrigation <- full_join(july.0to5cm.irrigation.classpolycorrelations,
+                                      select(july.5to15cm.irrigation.classpolycorrelations, -Factor, -Rank),
+                                  by = "Taxa", suffix = c(".0-5cm", ".5-15cm")) %>%
+  full_join(., select(july.15to25cm.irrigation.classpolycorrelations, -Factor, -Rank), by = "Taxa") %>%
+  dplyr::rename(EffectSize.15to25cm = EffectSize, Significance.15to25cm = Significance)
+
+
+
+###########################################################################################################
+### Check to see the different enrichment trends over irrigation for different depths in October soils. ###
+###########################################################################################################
+
+oct.0to5cm.irrigation.classpolycorrelations <- get_polycorrelations(subset_samples(rar.16s,
+                                                                                   Date == "10152020" &
+                                                                                     SampleType == "BulkSoil" &
+                                                                                     Depth == "0-5cm"),
+                                                                    rank = "Class", factor = "Irrigation", ntaxa = 20)
+
+oct.5to15cm.irrigation.classpolycorrelations <- get_polycorrelations(subset_samples(rar.16s,
+                                                                                    Date == "10152020" &
+                                                                                      SampleType == "BulkSoil" &
+                                                                                      Depth == "5-15cm"),
+                                                                    rank = "Class", factor = "Irrigation", ntaxa = 20)
+
+oct.15to25cm.irrigation.classpolycorrelations <- get_polycorrelations(subset_samples(rar.16s,
+                                                                                     Date == "10152020" &
+                                                                                       SampleType == "BulkSoil" &
+                                                                                       Depth == "15-25cm"),
+                                                                    rank = "Class", factor = "Irrigation", ntaxa = 20)
+
+oct.soil.irrigation <- full_join(oct.0to5cm.irrigation.classpolycorrelations,
+                                      select(oct.5to15cm.irrigation.classpolycorrelations, -Factor, -Rank),
+                                 by = "Taxa", suffix = c(".0-5cm", ".5-15cm")) %>%
+  full_join(., select(oct.15to25cm.irrigation.classpolycorrelations, -Factor, -Rank), by = "Taxa") %>%
+  dplyr::rename(EffectSize.15to25cm = EffectSize, Significance.15to25cm = Significance)
+
+
+
+    ########################################################
+    ### Class enrichment trends for rhizosphere samples. ###
+    ########################################################
+
+#####################################################################################################################
+### Check to see the different enrichment trends over irrigation for different depths in all rhizosphere samples. ###
+#####################################################################################################################
+
+alldates.0to5cm.irrigation.rhizo.classpolycorrelations <- get_polycorrelations(subset_samples(rar.16s,
+                                                                                              SampleType == "Rhizosphere" &
+                                                                                                Depth == "0-5cm"),
+                                                                    rank = "Class", factor = "Irrigation", ntaxa = 20)
+
+alldates.5to15cm.irrigation.rhizo.classpolycorrelations <- get_polycorrelations(subset_samples(rar.16s,
+                                                                                               SampleType == "Rhizosphere" &
+                                                                                                 Depth == "5-15cm"),
+                                                                    rank = "Class", factor = "Irrigation", ntaxa = 20)
+
+alldates.15to25cm.irrigation.rhizo.classpolycorrelations <- get_polycorrelations(subset_samples(rar.16s,
+                                                                                                SampleType == "Rhizosphere" &
+                                                                                                  Depth == "15-25cm"),
+                                                                    rank = "Class", factor = "Irrigation", ntaxa = 20)
+
+alldates.rhizo.irrigation <- full_join(alldates.0to5cm.irrigation.rhizo.classpolycorrelations,
+                                      select(alldates.5to15cm.irrigation.rhizo.classpolycorrelations, -Factor, -Rank),
+                                      by = "Taxa", suffix = c(".0-5cm", ".5-15cm")) %>%
+  full_join(., select(alldates.15to25cm.irrigation.rhizo.classpolycorrelations, -Factor, -Rank), by = "Taxa") %>%
+  dplyr::rename(EffectSize.15to25cm = EffectSize, Significance.15to25cm = Significance)
+
+
+
+######################################################################################################################
+### Check to see the different enrichment trends over irrigation for different depths in July rhizosphere samples. ###
+######################################################################################################################
+
+july.0to5cm.irrigation.rhizo.classpolycorrelations <- get_polycorrelations(subset_samples(rar.16s,
+                                                                                          Date == "07072020" &
+                                                                                            SampleType == "Rhizosphere" &
+                                                                                            Depth == "0-5cm"),
+                                                                    rank = "Class", factor = "Irrigation", ntaxa = 20)
+
+july.5to15cm.irrigation.rhizo.classpolycorrelations <- get_polycorrelations(subset_samples(rar.16s,
+                                                                                           Date == "07072020" &
+                                                                                             SampleType == "Rhizosphere" &
+                                                                                             Depth == "5-15cm"),
+                                                                    rank = "Class", factor = "Irrigation", ntaxa = 20)
+
+july.15to25cm.irrigation.rhizo.classpolycorrelations <- get_polycorrelations(subset_samples(rar.16s,
+                                                                                            Date == "07072020" &
+                                                                                              SampleType == "Rhizosphere" &
+                                                                                              Depth == "15-25cm"),
+                                                                    rank = "Class", factor = "Irrigation", ntaxa = 20)
+
+july.rhizo.irrigation <- full_join(july.0to5cm.irrigation.rhizo.classpolycorrelations,
+                                      select(july.5to15cm.irrigation.rhizo.classpolycorrelations, -Factor, -Rank),
+                                   by = "Taxa", suffix = c(".0-5cm", ".5-15cm")) %>%
+  full_join(., select(july.15to25cm.irrigation.rhizo.classpolycorrelations, -Factor, -Rank), by = "Taxa") %>%
+  dplyr::rename(EffectSize.15to25cm = EffectSize, Significance.15to25cm = Significance)
+
+
+
+#########################################################################################################################
+### Check to see the different enrichment trends over irrigation for different depths in October rhizosphere samples. ###
+#########################################################################################################################
+
+oct.0to5cm.irrigation.rhizo.classpolycorrelations <- get_polycorrelations(subset_samples(rar.16s,
+                                                                                         Date == "10152020" &
+                                                                                           SampleType == "Rhizosphere" &
+                                                                                           Depth == "0-5cm"),
+                                                                    rank = "Class", factor = "Irrigation", ntaxa = 20)
+
+oct.5to15cm.irrigation.rhizo.classpolycorrelations <- get_polycorrelations(subset_samples(rar.16s,
+                                                                                          Date == "10152020" &
+                                                                                            SampleType == "Rhizosphere" &
+                                                                                            Depth == "5-15cm"),
+                                                                    rank = "Class", factor = "Irrigation", ntaxa = 20)
+
+oct.15to25cm.irrigation.rhizo.classpolycorrelations <- get_polycorrelations(subset_samples(rar.16s,
+                                                                                           Date == "10152020" &
+                                                                                             SampleType == "Rhizosphere" &
+                                                                                             Depth == "15-25cm"),
+                                                                    rank = "Class", factor = "Irrigation", ntaxa = 20)
+
+
+oct.rhizo.irrigation <- full_join(oct.0to5cm.irrigation.rhizo.classpolycorrelations,
+                                      select(oct.5to15cm.irrigation.rhizo.classpolycorrelations, -Factor, -Rank),
+                                  by = "Taxa", suffix = c(".0to5cm", ".5to15cm")) %>%
+  full_join(., select(oct.15to25cm.irrigation.rhizo.classpolycorrelations, -Factor, -Rank), by = "Taxa") %>% dplyr::rename(EffectSize.15to25cm = EffectSize, Significance.15to25cm = Significance)
+
+poly_sheets_irrigationbydepth <- list("AllSoils" = alldates.soil.irrigation,
+                                      "AprilSoils" = april.soil.irrigation,
+                                      "JulySoils" = july.soil.irrigation,
+                                      "OctSoils" = oct.soil.irrigation,
+                                      "AllRhizo" = alldates.rhizo.irrigation,
+                                      "JulyRhizo" = july.rhizo.irrigation,
+                                      "OctRhizo" = oct.rhizo.irrigation)
+
+# write_xlsx(poly_sheets_irrigationbydepth, "../figures/polyserialcorrelations/fulldataset_irrigation_polycorrelations.xlsx")
+
+```
+
+### 5) DESeq.
+
+## 5.0) Basic DESeq function
+
+Write a function to run DESeq on an OTU table, checking for enrichment based on a factor you supply as an argument,
+then return a results table with significances.
+
+```{r 5.0-deseq-function}
+
+func.deseq <- function(rar, factor = "Irrigation"){
+  f <- as.formula(paste("~", factor, sep = " "))
+  ds <- phyloseq_to_deseq2(rar, f) %>% DESeq(., test = "Wald", fitType = "parametric")
+  res <- results(ds, cooksCutoff = FALSE) %>% na.omit()
+  # return(res)
+  sigtab <- res[which(res$padj < 0.05),] # Can make the alpha-level an additional argument if you want.
+  sigtab <- cbind(as.data.frame(sigtab), as(tax_table(rar)[rownames(sigtab),],"matrix"))
+  return(sigtab)
+}
+
+```
+
+## 5.1) Get DESeq results for irrigation (T5 / T1) at different depth levels.
+
+```{r 5.1-deseq-by-irrigation}
+
+########################################
+## What did trends look like overall? ##
+########################################
+
+sigtab.allsampletypes.t1t5.0_5cm <- func.deseq(subset_samples(rar.16s, Irrigation %in% c("T1", "T5") & Depth == "0-5cm"))
+# dim(sigtab.allsampletypes.t1t5.0_5cm) # => 300 significant OTUs.
+
+sigtab.allsampletypes.t1t5.5_15cm <- func.deseq(subset_samples(rar.16s, Irrigation %in% c("T1", "T5") & Depth == "5-15cm"))
+# dim(sigtab.allsampletypes.t1t5.5_15cm) # => 97 significant OTUs.
+
+sigtab.allsampletypes.t1t5.15_25cm <- func.deseq(subset_samples(rar.16s, Irrigation %in% c("T1", "T5") & Depth == "15-25cm"))
+# dim(sigtab.allsampletypes.t1t5.15_25cm) # => 105 significant OTUs.
+
+######################################################
+## What did trends look like specifically in soils? ##
+######################################################
+
+sigtab.soil.t1t5.0_5cm <- func.deseq(subset_samples(rar.16s,
+                                                    SampleType == "BulkSoil" & Irrigation %in% c("T1", "T5") & Depth == "0-5cm"))
+  # 269 significant OTUs.
+
+sigtab.soil.t1t5.5_15cm <- func.deseq(subset_samples(rar.16s,
+                                                     SampleType == "BulkSoil" & Irrigation %in% c("T1", "T5") & Depth == "5-15cm"))
+  # 68 significant OTUs.
+
+sigtab.soil.t1t5.15_25cm <- func.deseq(subset_samples(rar.16s,
+                                                      SampleType == "BulkSoil" & Irrigation %in% c("T1", "T5") & Depth == "15-25cm"))
+  # 65 significant OTUs.
+
+############################################################
+## What did trends look like specifically in rhizosphere? ##
+############################################################
+
+sigtab.rhizo.t1t5.0_5cm <- func.deseq(subset_samples(rar.16s,
+                                                     SampleType == "Rhizosphere" & Irrigation %in% c("T1", "T4") &
+                                                       Depth == "0-5cm"))
+  # 1 significant OTU.
+
+sigtab.rhizo.t1t5.5_15cm <- func.deseq(subset_samples(rar.16s,
+                                                      SampleType == "Rhizosphere" & Irrigation %in% c("T1", "T4") &
+                                                        Depth == "5-15cm"))
+  # 1 significant OTU (same as above).
+
+sigtab.rhizo.t1t5.15_25cm <- func.deseq(subset_samples(rar.16s,
+                                                       SampleType == "Rhizosphere" & Irrigation %in% c("T1", "T4") &
+                                                         Depth == "15-25cm"))
+  # 2 significant OTUs; 1 is the same as before (an OTU from genus Geobacter).
+
+```
+
+# 5.2) Figure 4.
+
+Making a dot plot to show which taxa are significantly differentially enriched based on irrigation
+at each of the three different depths. Dots are colored based on what microbial class they belong to.
+
+```{r 5.2-Figure4-DESeqplot-all-soils-differentially-abundant-taxa}
+
+class_levels <- c("Acidimicrobiia", "Actinobacteria", "Alphaproteobacteria", "Bacilli",
+                  "Betaproteobacteria", "Blastocatellia",
+                  "Chloroflexi_Subdivision_10", "Deltaproteobacteria", "Gammaproteobacteria",
+                  "Gemmatimonadetes", "Nitrososphaeria",
+                  "Phycisphaerae", "Planctomycetacia", "Subgroup_6", "Thermoleophilia", "Other")
+
+class.palette <- c(viridis(7), rev(magma(8)), "gray34")
+
+  ##################
+  ## 0-5 cm plot. ##
+  ##################
+
+# Class order.
+sigtab.soil.t1t5.0_5cm$Class[which(!sigtab.soil.t1t5.0_5cm$Class %in% class_levels)] <- "Other"
+sigtab.soil.t1t5.0_5cm$Class = factor(as.character(sigtab.soil.t1t5.0_5cm$Class), levels= class_levels)
+# Order the genera by their max fold change.
+gen.order.0_5cm = tapply(sigtab.soil.t1t5.0_5cm$log2FoldChange, sigtab.soil.t1t5.0_5cm$Genus, function(x) max(x))
+gen.order.0_5cm = sort(gen.order.0_5cm, TRUE)
+sigtab.soil.t1t5.0_5cm$Genus = factor(as.character(sigtab.soil.t1t5.0_5cm$Genus), levels=names(gen.order.0_5cm))
+
+# Remove the unknown genera.
+sigtab.soil.t1t5.0_5cm <- sigtab.soil.t1t5.0_5cm[sigtab.soil.t1t5.0_5cm$Genus != "?",]
+
+deseqtaxa.0_5cmplot <- ggplot(sigtab.soil.t1t5.0_5cm, aes(x=Genus, y=log2FoldChange, color=Class)) + geom_point(size=6) + 
+  theme(axis.text.x = element_text(angle = -90, hjust = 0, vjust=0.5)) + scale_color_manual(values = class.palette, drop = FALSE) +
+  ggtitle("DESeq - differentially abundant OTUs by Irrigation\nT5 / T1 - 0-5 cm")
+
+  ###################
+  ## 5-15 cm plot. ##
+  ###################
+
+# Class order.
+sigtab.soil.t1t5.5_15cm$Class[which(!sigtab.soil.t1t5.5_15cm$Class %in% class_levels)] <- "Other"
+sigtab.soil.t1t5.5_15cm$Class = factor(as.character(sigtab.soil.t1t5.5_15cm$Class), levels= class_levels)
+# Order the genera by their max fold change.
+gen.order.5_15cm = tapply(sigtab.soil.t1t5.5_15cm$log2FoldChange, sigtab.soil.t1t5.5_15cm$Genus, function(x) max(x))
+gen.order.5_15cm = sort(gen.order.5_15cm, TRUE)
+sigtab.soil.t1t5.5_15cm$Genus = factor(as.character(sigtab.soil.t1t5.5_15cm$Genus), levels=names(gen.order.5_15cm))
+
+# Remove the unknown genera.
+sigtab.soil.t1t5.5_15cm <- sigtab.soil.t1t5.5_15cm[sigtab.soil.t1t5.5_15cm$Genus != "?",]
+
+deseqtaxa.5_15cmplot <- ggplot(sigtab.soil.t1t5.5_15cm, aes(x=Genus, y=log2FoldChange, color=Class)) + geom_point(size=6) + 
+  theme(axis.text.x = element_text(angle = -90, hjust = 0, vjust=0.5)) + scale_color_manual(values = class.palette, drop = FALSE) +
+  ggtitle("DESeq - differentially abundant OTUs by Irrigation\nT5 / T1 - 5-15 cm")
+
+  ####################
+  ## 15-25 cm plot. ##
+  ####################
+
+# Class order.
+sigtab.soil.t1t5.15_25cm$Class[which(!sigtab.soil.t1t5.15_25cm$Class %in% class_levels)] <- "Other"
+sigtab.soil.t1t5.15_25cm$Class = factor(as.character(sigtab.soil.t1t5.15_25cm$Class), levels= class_levels)
+# Order the genera by their max fold change.
+gen.order.15_25cm = tapply(sigtab.soil.t1t5.15_25cm$log2FoldChange, sigtab.soil.t1t5.15_25cm$Genus, function(x) max(x))
+gen.order.15_25cm = sort(gen.order.15_25cm, TRUE)
+sigtab.soil.t1t5.15_25cm$Genus = factor(as.character(sigtab.soil.t1t5.15_25cm$Genus), levels=names(gen.order.15_25cm))
+
+# Remove the unknown genera.
+sigtab.soil.t1t5.15_25cm <- sigtab.soil.t1t5.15_25cm[sigtab.soil.t1t5.15_25cm$Genus != "?",]
+
+deseqtaxa.15_25cmplot <- ggplot(sigtab.soil.t1t5.15_25cm, aes(x=Genus, y=log2FoldChange, color=Class)) + geom_point(size=6) + 
+  theme(axis.text.x = element_text(angle = -90, hjust = 0, vjust=0.5)) + scale_color_manual(values = class.palette, drop = FALSE) +
+  ggtitle("DESeq - differentially abundant OTUs by Irrigation\nT5 / T1 - 15-25 cm")
+
+  #####################################
+  ## Concatenate the plots together. ##
+  #####################################
+
+deseq_themes <- list(theme(plot.title = element_text(size = 24, face = "bold", hjust = 0.5),
+                           axis.title = element_text(size = 18, face = "bold"),
+                           legend.text = element_text(size = 16), legend.title = element_text(size = 20),
+                           axis.text = element_text(size = 14)),
+                     geom_hline(yintercept=0, linetype="dashed", color = "gray75"))
+
+plot_grid(deseqtaxa.0_5cmplot + deseq_themes, labels = c("A)", ""), label_size = 24,
+          plot_grid(deseqtaxa.5_15cmplot + deseq_themes + theme(legend.position = "none"),
+                    deseqtaxa.15_25cmplot + deseq_themes + theme(legend.position = "none"),
+                    labels = c("B)", "C)"), label_size = 24,
+                    ncol = 2), ncol = 1, rel_heights = c(1.1, 0.9)) %>%
+  ggsave("../submission_figures/Figure4.jpg", plot = ., height = 12, width = 17, scale = 1.1, dpi = 400)
+
+
+```
+
+## 5.3) DESeq - irrigation trends between cultivars.
+
+Note: this code block was already run as part of section 3.2.1 so as to generate Supplemental Figure 6.
+
+```{r 5.3-rhizospheres-differentially-abundant-taxa-by-cultivar-irrigation}
+
+# class_levels <- c("Acidimicrobiia", "Actinobacteria", "Alphaproteobacteria", "Bacilli", "Betaproteobacteria", "Blastocatellia",
+#                   "Chloroflexi_Subdivision_10", "Deltaproteobacteria", "Gammaproteobacteria", "Gemmatimonadetes", "Nitrososphaeria",
+#                   "Phycisphaerae", "Planctomycetacia", "Subgroup_6", "Thermoleophilia", "Other")
+# 
+# class.palette <- c(viridis(7), rev(magma(8)), "gray34")
+# 
+# ################################
+# ### Rhizosphere by Cultivar ###
+# ###############################
+# 
+#   # Is the cultivar effect stronger at July or October?
+# sigtab.rhizo.bycultivar.july <- func.deseq(subset_samples(rar.16s, SampleType == "Rhizosphere" & Date == "07072020"), factor = "Cultivar")
+#     # No significant OTUs
+# sigtab.rhizo.bycultivar.oct <- func.deseq(subset_samples(rar.16s, SampleType == "Rhizosphere" & Date == "10152020"), factor = "Cultivar")
+#     # No significant OTUs
+# 
+#   # Is the cultivar effect stronger at T4 or T1 irrigation?
+# sigtab.rhizo.bycultivar.t1 <- func.deseq(subset_samples(rar.16s, SampleType == "Rhizosphere" & Irrigation == "T1"), factor = "Cultivar")
+#     # No significant OTUs.
+# sigtab.rhizo.bycultivar.t4 <- func.deseq(subset_samples(rar.16s, SampleType == "Rhizosphere" & Irrigation == "T4"), factor = "Cultivar")
+#     # 19 significant OTUs.
+# 
+# sigtab.rhizo.bycultivar.july.t1 <- func.deseq(subset_samples(rar.16s, SampleType == "Rhizosphere" & Date == "07072020" & Irrigation == "T1"), factor = "Cultivar")
+#     # No significant OTUs
+# sigtab.rhizo.bycultivar.july.t4 <- func.deseq(subset_samples(rar.16s, SampleType == "Rhizosphere" & Date == "07072020" & Irrigation == "T4"), factor = "Cultivar")
+#     # No significant OTUs
+# 
+# sigtab.rhizo.bycultivar.oct.t1 <- func.deseq(subset_samples(rar.16s, SampleType == "Rhizosphere" & Date == "10152020" & Irrigation == "T1"), factor = "Cultivar")
+#     # 3 significant OTUs
+# sigtab.rhizo.bycultivar.oct.t4 <- func.deseq(subset_samples(rar.16s, SampleType == "Rhizosphere" & Date == "10152020" & Irrigation == "T4"), factor = "Cultivar")
+#     # 2 significant OTU.
+# 
+# ######################################
+# ### Irrigation trends by cultivar. ###
+# ######################################
+# 
+# sigtab.alkar.byirrigation <- func.deseq(subset_samples(rar.16s, SampleType == "Rhizosphere" & Irrigation %in% c("T1", "T4") & Cultivar == "Alkar"), factor = "Irrigation")
+#   # 92 significant OTUs.
+# 
+# sigtab.jose.byirrigation <- func.deseq(subset_samples(rar.16s, SampleType == "Rhizosphere" & Irrigation %in% c("T1", "T4") & Cultivar == "Jose"), factor = "Irrigation")
+#   # 1 significant OTUs.
+# 
+#   ####################
+#   ## T4/T1 - Alkar. ##
+#   ####################
+# 
+# # Class order
+# sigtab.alkar.byirrigation$Class[which(!sigtab.alkar.byirrigation$Class %in% class_levels)] <- "Other"
+# sigtab.alkar.byirrigation$Class = factor(as.character(sigtab.alkar.byirrigation$Class), levels= class_levels)
+# # Order the genera by their max fold change.
+# gen.order.alkar = tapply(sigtab.alkar.byirrigation$log2FoldChange, sigtab.alkar.byirrigation$Genus, function(x) max(x))
+# gen.order.alkar = sort(gen.order.alkar, TRUE)
+# sigtab.alkar.byirrigation$Genus = factor(as.character(sigtab.alkar.byirrigation$Genus), levels=names(gen.order.alkar))
+# 
+# # Remove the unknown genera.
+# sigtab.alkar.byirrigation <- sigtab.alkar.byirrigation[sigtab.alkar.byirrigation$Genus != "?",]
+# 
+#   #######################
+#   ## Rhizosphere - T4. ##
+#   #######################
+# 
+# # Class order
+# sigtab.jose.byirrigation$Class[which(!sigtab.jose.byirrigation$Class %in% class_levels)] <- "Other"
+# sigtab.jose.byirrigation$Class = factor(as.character(sigtab.jose.byirrigation$Class), levels= class_levels)
+# # Order the genera by their max fold change.
+# gen.order.jose = tapply(sigtab.jose.byirrigation$log2FoldChange, sigtab.jose.byirrigation$Genus, function(x) max(x))
+# gen.order.jose = sort(gen.order.jose, TRUE)
+# sigtab.jose.byirrigation$Genus = factor(as.character(sigtab.jose.byirrigation$Genus), levels=names(gen.order.jose))
+# 
+# # Remove the unknown genera.
+# sigtab.jose.byirrigation <- sigtab.jose.byirrigation[sigtab.jose.byirrigation$Genus != "?",]
+# 
+#   #####################
+#   ## Plot these out. ##
+#   #####################
+# 
+# deseqtaxa.byirrigation.alkar <- ggplot(sigtab.alkar.byirrigation, aes(x=Genus, y=log2FoldChange, color=Class)) + geom_point(size = 6.5, color = "black") + geom_point(size=6) + 
+#   theme(axis.text.x = element_text(angle = -90, hjust = 0, vjust=0.5)) + scale_color_manual(values = class.palette, drop = FALSE) +
+#   ggtitle("\nDESeq - Differentially Abundant OTUs by Irrigation\nT4/T1 - Alkar Rhizosphere")
+# 
+# deseqtaxa.byirrigation.jose <- ggplot(sigtab.jose.byirrigation, aes(x=Genus, y=log2FoldChange, color=Class)) + geom_point(size = 6.5, color = "black") + geom_point(size=6) + 
+#   theme(axis.text.x = element_text(angle = -90, hjust = 0, vjust=0.5)) + scale_color_manual(values = class.palette, drop = FALSE) +
+#   ggtitle("\n\nJose") + xlab("\n\n\n")
+# 
+#   #####################
+#   ## Plot these out. ##
+#   #####################
+# 
+# deseq_themes <- list(theme(plot.title = element_text(size = 24, face = "bold", hjust = 0.5),
+#                            axis.title = element_text(size = 18, face = "bold"),
+#                            legend.text = element_text(size = 16), legend.title = element_text(size = 20),
+#                            axis.text = element_text(size = 14)),
+#                      geom_hline(yintercept=0, linetype="dashed", color = "gray75"))
+# 
+# deseq_irrigationbycultivar <- plot_grid(deseqtaxa.byirrigation.alkar + deseq_themes + theme(legend.position = "none"),
+#                                         deseqtaxa.byirrigation.jose + deseq_themes + theme(legend.position = "none") + theme(axis.title.y = element_blank()),
+#           ncol = 2, rel_widths = c(1.8, 0.2), labels = c("\nd)", ""), label_size = 24)
+# 
+# save_plot("../figures/deseq/deseq_differentiallyabundanttaxa_cultivar_by_irrigation.pdf", plot = deseq_irrigationbycultivar, base_height = 6, base_width = 12, scale = 1.5)
+
+# relabundance_cultivar <- plot_grid(class_plot.rhizosphere.cultivar, class_plot.rhizosphere.cultivar.byirrigation, class_plot.rhizosphere.cultivar.bydepth,
+#           ncol = 3, rel_widths = c(0.65, 0.95, 1.4), labels = c("a)", "b)", "c)"), label_size = 24)
+# 
+# cultivar_relabundance_with_deseq <- plot_grid(relabundance_cultivar, deseq_irrigationbycultivar, nrow = 2)
+# 
+# save_plot("../figures/deseq/deseq_with_relabundance.pdf", plot = cultivar_relabundance_with_deseq, base_width = 12, base_height = 12, scale = 1.5)
+
+
+```
+
+
+# 6) Indicator species analysis.
+
+In this code block, we're going to generate indicator genera for the various irrigation regimes or depths; I specifically
+want to see if the types of genera that are most strongly associated with lower soil depths, or with drier soils (or both)
+tend to be oligotrophic taxa or not.
+
+```{r 6.1-indicator-genera, results = 'hide'}
+
+# The first step is to make a phyloseq object glommed by the taxonomic rank of interest (here, "Genus").
+rar.genus <- tax_glom(rar.16s, taxrank = "Genus")
+# rar.genus.copy <- rar.genus # Make a copy, because it takes 5 minutes or so to generate that initial glommed object.
+
+# The trends for irrigation may be stronger in the rhizosphere, while those for depth may be stronger in the bulk soil.
+# For this reason, I would like to run indicator analysis on these compartments separately.
+rar.genus.soil <- subset_samples(rar.genus, SampleType == "BulkSoil")
+rar.genus.rz <- subset_samples(rar.genus, SampleType == "Rhizosphere")
+
+# Add in interaction factors for looking at the combined effects of depth by irrigation.
+sample_data(rar.genus.soil)[["Depth_by_Irrigation"]] <- interaction(sample_data(rar.genus.soil)[["Depth"]], sample_data(rar.genus.soil)[["Irrigation"]], sep = "_")
+sample_data(rar.genus.rz)[["Depth_by_Irrigation"]] <- interaction(sample_data(rar.genus.rz)[["Depth"]], sample_data(rar.genus.rz)[["Irrigation"]], sep = "_")
+
+
+# Run the indicator species analysis through a custom function that takes as arguments a phyloseq object and a variable of interest from which to generate indicators.
+get_indicators <- function(phy, variable = "Depth"){
+  # Get the dataframe with all normalized counts. Remove the taxa that are zeros in all samples.
+  counts <- as.data.frame(otu_table(phy)) %>% t()
+  counts <- counts[,!apply(counts==0,2,all)]
+  
+  # Get the metadata.
+  metadata <- as.data.frame(sample_data(phy))
+  
+  # Make a dataframe for the grouping variable, and numbers to assign to them.
+  grouping <- data.frame(Variable = metadata[[variable]], Num = as.numeric(as.factor(metadata[[variable]])))
+  
+  # Run the indicator analysis on the factors of interest.
+  ind.names <- indval(counts, grouping$Num)
+  
+  ## Collating the indicator results. ##
+  gr <- ind.names$maxcls[ind.names$pval<=0.05]
+  iv <- ind.names$indcls[ind.names$pval<=0.05]
+  pv <- ind.names$pval[ind.names$pval<=0.05]
+  fr <- apply(counts[,]>0, 2, sum)[ind.names$pval<=0.05]
+  
+  # Initialize a dataframe.
+  ind.summary <- data.frame(group = gr, indval = iv, pvalue = pv, freq = fr)
+  ind.summary <- ind.summary[order(ind.summary$group, -ind.summary$indval),]
+  
+  for(i in 1:nrow(ind.summary)){
+    x <- ind.summary$group[i]
+    y <- as.character(unique(grouping[grouping$Num == x, 1]))
+    ind.summary$group2[i] <- y
+  }
+  
+  colnames(ind.summary)[colnames(ind.summary) == "group2"] <- "Factor Name"
+  
+  # Add on the taxonomic information.
+  tax <- tax_table(phy)[rownames(ind.summary),]
+  ind.summary <- cbind(ind.summary, tax)
+  
+  
+  return(ind.summary)
+}
+
+# Run the function to get the indicators.
+soil.genus.depthindicators <- get_indicators(rar.genus.soil, variable = "Depth")
+soil.genus.irrigationindicators <- get_indicators(rar.genus.soil, variable = "Irrigation")
+soil.genus.depthbyirrigationindicators <- get_indicators(rar.genus.soil, variable = "Depth_by_Irrigation")
+
+rz.genus.depthindicators <- get_indicators(rar.genus.rz, variable = "Depth")
+rz.genus.irrigationindicators <- get_indicators(rar.genus.rz, variable = "Irrigation")
+rz.genus.depthbyirrigationindicators <- get_indicators(rar.genus.rz, variable = "Depth_by_Irrigation")
+
+# Write an excel table with all of these indicators.
+ind.list <- list("Soil_Depth" = soil.genus.depthindicators,
+                 "Soil_Irrigation" = soil.genus.irrigationindicators,
+                 "Soil_Interaction" = soil.genus.depthbyirrigationindicators,
+                 "Rhizo_Depth" = rz.genus.depthindicators,
+                 "Rhizo_Irrigation" = rz.genus.irrigationindicators,
+                 "Rhizo_Interaction" = rz.genus.depthbyirrigationindicators)
+# write_xlsx(ind.list, "../tables/genus_indicators.xlsx")
+
+```
+
+```{r 6.2-indicator-list-with-significances}
+
+# Making the data frames that are the necessary components for the function.
+# Starting with the taxonomy table.
+genus.table <- data.frame(tax_table(rar.genus)[,1:6])
+genus.table$Phylum <- gsub("p__", "", genus.table$Phylum)
+genus.table$Class <- gsub("c__", "", genus.table$Class)
+genus.table$Order <- gsub("o__", "", genus.table$Order)
+genus.table$Family <- gsub("f__", "", genus.table$Family)
+genus.table$Genus <- gsub("g__", "", genus.table$Genus)
+
+# genus.table$Taxonomy <- paste(genus.table$Phylum, genus.table$Class, genus.table$Order,
+#                                       genus.table$Genus, sep = "_")
+
+
+genus.otu.table <- t(data.frame(otu_table(rar.genus))) # <- t() is there because we need to transpose species and samples for indval().
+genus.otu.table <- genus.otu.table[order(rownames(genus.otu.table)),]
+# Remove the OTUs that are zeros in all samples.
+genus.otu.table <- genus.otu.table[,!apply(genus.otu.table==0,2,all)]
+# Get the necessary metadata.
+genus.metadata <- data.frame(sample_data(rar.genus))
+genus.metadata <- genus.metadata[order(rownames(genus.metadata)),]
+
+# Make dataframes for the grouping variable and a number to assign to them.
+genus.mod.grouping <- data.frame(ModuleName = genus.metadata$ModuleName, ModuleNum = as.numeric(as.factor(genus.metadata$ModuleName)))
+genus.antibiotic.grouping <- data.frame(AntibioticName = genus.metadata$Antibiotic, AntibioticNum = as.numeric(genus.metadata$Antibiotic))
+
+# Run the indicator species for each of the factors of interest.
+ind.genus.modname <- indval(genus.otu.table, genus.mod.grouping$ModuleNum)
+
+# Now for some more in-depth analysis.
+
+# Module Name first.
+genus.gr.modname <- ind.genus.modname$maxcls[ind.genus.modname$pval<=0.05]
+genus.iv.modname <- ind.genus.modname$indcls[ind.genus.modname$pval<=0.05]
+genus.pv.modname <- ind.genus.modname$pval[ind.genus.modname$pval<=0.05]
+genus.fr.modname <- apply(genus.otu.table[,]>0, 2, sum)[ind.genus.modname$pval<=0.05]
+genus.modname.summary <- data.frame(group = genus.gr.modname, indval = genus.iv.modname, pvalue = genus.pv.modname, freq = genus.fr.modname)
+genus.modname.summary <- genus.modname.summary[order(genus.modname.summary$group, -genus.modname.summary$indval),]
+
+for(i in 1:nrow(genus.modname.summary)){
+  x <- genus.modname.summary$group[i]
+  y <- as.character(unique(genus.mod.grouping[genus.mod.grouping$ModuleNum == x, 1]))
+  genus.modname.summary$group2[i] <- y
+}
+
+# Add on the taxonomy.
+genus.modname.tax <- genus.table[rownames(genus.modname.summary),]
+genus.modname.summary <- cbind(genus.modname.summary, genus.modname.tax) # Now you can go through and look at this in more detail to see indicator genera by taxonomy.
+
+for(i in 1:nrow(genus.modname.summary)){
+  if(!grepl("_", genus.modname.summary$group2[i])){
+    genus.modname.summary$group2[i] <- paste("control_", genus.modname.summary$group2[i], sep = "")
+  }
+}
+
+genus.modname.summary$Domain <- gsub("k__", "", genus.modname.summary$Domain)
+colnames(genus.modname.summary)[colnames(genus.modname.summary) == "group2"] <- "Module Name"
+genus.modname.summary$`Module Name` <- gsub("control_", "", genus.modname.summary$`Module Name`)
+genus.modname.summary$`Module Name` <- gsub("_control", "", genus.modname.summary$`Module Name`)
+
+# write.table(genus.modname.summary, "final_figures/SupplementalTable10.txt", sep = "\t", col.names = NA)
+
+```
+
